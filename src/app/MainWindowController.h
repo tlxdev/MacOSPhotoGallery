@@ -19,6 +19,7 @@
 
 /* Actions */
 - (void)openFolder:(id)sender;
+- (void)openFolderAtPath:(NSString *)path;
 - (void)toggleGridView:(id)sender;
 - (void)toggleMetadata:(id)sender;
 - (void)previousPhoto:(id)sender;
@@ -29,6 +30,7 @@
 - (void)zoomToFit:(id)sender;
 - (void)shareCurrentPhoto:(id)sender;
 - (void)showInFinder:(id)sender;
+- (void)copyCurrentPhoto:(id)sender;
 
 @end
 

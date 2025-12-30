@@ -45,6 +45,12 @@
             </array>
         </dict>
     </array>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>PhotoViewer needs access to display your photos.</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>PhotoViewer needs access to open folders containing photos.</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>PhotoViewer needs access to open folders containing photos.</string>
 </dict>
 </plist>
 

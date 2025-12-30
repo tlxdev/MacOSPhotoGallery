@@ -4,6 +4,7 @@
  */
 
 #import "MainWindowController.h"
+#import "RecentsManager.h"
 #import "../models/PhotoStore.h"
 #import "../models/PhotoItem.h"
 #import "../views/PhotoView.h"
@@ -12,6 +13,7 @@
 #import "../views/ToolbarView.h"
 #import "../views/ThumbnailCache.h"
 #import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
 
 static const CGFloat kWindowMinWidth = 800.0;
 static const CGFloat kWindowMinHeight = 600.0;
@@ -91,6 +93,12 @@ static const CGFloat kMetadataPanelWidth = 280.0;
     };
     self.photoStore.onPhotosLoaded = ^(NSUInteger count) {
         [weakSelf handlePhotosLoaded:count];
+    };
+    self.photoStore.onError = ^(NSError *error) {
+        [weakSelf handleError:error];
+    };
+    self.photoStore.onFolderChanged = ^{
+        [weakSelf handleFolderChanged];
     };
 }
 
@@ -219,6 +227,30 @@ static const CGFloat kMetadataPanelWidth = 280.0;
     openButton.keyEquivalent = @"\r";
     [stack addArrangedSubview:openButton];
     
+    /* Recents section */
+    NSArray *recents = [[RecentsManager sharedManager] recentFolders];
+    if (recents.count > 0) {
+        /* Spacer */
+        NSView *spacer = [[NSView alloc] init];
+        spacer.translatesAutoresizingMaskIntoConstraints = NO;
+        [spacer.heightAnchor constraintEqualToConstant:8].active = YES;
+        [stack addArrangedSubview:spacer];
+        
+        /* Recents label */
+        NSTextField *recentsLabel = [NSTextField labelWithString:@"Recent Folders"];
+        recentsLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
+        recentsLabel.textColor = [NSColor colorWithWhite:0.45 alpha:1.0];
+        [stack addArrangedSubview:recentsLabel];
+        
+        /* Recents list (show up to 5) */
+        NSUInteger maxToShow = MIN(recents.count, 5);
+        for (NSUInteger i = 0; i < maxToShow; i++) {
+            NSString *path = recents[i];
+            NSButton *recentButton = [self createRecentButtonForPath:path];
+            [stack addArrangedSubview:recentButton];
+        }
+    }
+    
     /* Keyboard hints */
     NSTextField *hints = [NSTextField labelWithString:@"Arrow keys to navigate  |  G for grid  |  I for info"];
     hints.font = [NSFont systemFontOfSize:11 weight:NSFontWeightRegular];
@@ -236,6 +268,43 @@ static const CGFloat kMetadataPanelWidth = 280.0;
         
         [openButton.widthAnchor constraintGreaterThanOrEqualToConstant:140],
     ]];
+}
+
+- (NSButton *)createRecentButtonForPath:(NSString *)path {
+    NSButton *button = [[NSButton alloc] init];
+    button.translatesAutoresizingMaskIntoConstraints = NO;
+    button.bezelStyle = NSBezelStyleAccessoryBarAction;
+    button.bordered = NO;
+    
+    /* Folder icon */
+    NSImage *folderIcon = [NSImage imageWithSystemSymbolName:@"folder.fill" accessibilityDescription:nil];
+    button.image = folderIcon;
+    button.imagePosition = NSImageLeft;
+    button.symbolConfiguration = [NSImageSymbolConfiguration configurationWithPointSize:12 weight:NSFontWeightRegular];
+    
+    /* Folder name */
+    button.title = path.lastPathComponent;
+    button.font = [NSFont systemFontOfSize:13 weight:NSFontWeightRegular];
+    button.contentTintColor = [NSColor colorWithWhite:0.7 alpha:1.0];
+    
+    /* Store path and set action */
+    button.toolTip = path;
+    button.target = self;
+    button.action = @selector(openRecentFromWelcome:);
+    
+    /* Use associated object to store path */
+    objc_setAssociatedObject(button, "recentPath", path, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    
+    [button.widthAnchor constraintGreaterThanOrEqualToConstant:200].active = YES;
+    
+    return button;
+}
+
+- (void)openRecentFromWelcome:(NSButton *)sender {
+    NSString *path = objc_getAssociatedObject(sender, "recentPath");
+    if (path) {
+        [self openFolderAtPath:path];
+    }
 }
 
 - (void)hideWelcomeView {
@@ -266,6 +335,12 @@ static const CGFloat kMetadataPanelWidth = 280.0;
         case 124: /* Right arrow */
             [self nextPhoto:nil];
             return YES;
+        case 8: /* C */
+            if (event.modifierFlags & NSEventModifierFlagCommand) {
+                [self copyCurrentPhoto:nil];
+                return YES;
+            }
+            break;
         case 5: /* G */
             if (!(event.modifierFlags & NSEventModifierFlagCommand)) {
                 [self toggleGridView:nil];
@@ -313,6 +388,21 @@ static const CGFloat kMetadataPanelWidth = 280.0;
     }
 }
 
+- (void)handleError:(NSError *)error {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.alertStyle = NSAlertStyleWarning;
+    alert.messageText = @"Error";
+    alert.informativeText = error.localizedDescription;
+    [alert addButtonWithTitle:@"OK"];
+    [alert beginSheetModalForWindow:self.window completionHandler:nil];
+}
+
+- (void)handleFolderChanged {
+    /* Show brief notification that folder changed */
+    /* Auto-rescan the folder to pick up changes */
+    [self.photoStore rescanCurrentFolder];
+}
+
 - (void)startThumbnailPreloading {
     NSMutableArray<NSString *> *paths = [NSMutableArray arrayWithCapacity:self.photoStore.photoCount];
     
@@ -338,9 +428,20 @@ static const CGFloat kMetadataPanelWidth = 280.0;
     
     [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse result) {
         if (result == NSModalResponseOK && panel.URL) {
-            [self.photoStore scanDirectory:panel.URL.path];
+            [self openFolderAtPath:panel.URL.path];
         }
     }];
+}
+
+- (void)openFolderAtPath:(NSString *)path {
+    if (!path) {
+        return;
+    }
+    
+    if ([self.photoStore scanDirectory:path]) {
+        /* Add to recents on successful scan start */
+        [[RecentsManager sharedManager] addRecentFolder:path];
+    }
 }
 
 - (void)toggleGridView:(id)sender {
@@ -421,6 +522,26 @@ static const CGFloat kMetadataPanelWidth = 280.0;
     if (photo) {
         [[NSWorkspace sharedWorkspace] selectFile:photo.path inFileViewerRootedAtPath:@""];
     }
+}
+
+- (void)copyCurrentPhoto:(id)sender {
+    PhotoItem *photo = [self.photoStore currentPhoto];
+    if (!photo) {
+        return;
+    }
+    
+    /* Load the full image */
+    NSURL *url = [NSURL fileURLWithPath:photo.path];
+    NSImage *image = [[NSImage alloc] initWithContentsOfURL:url];
+    
+    if (!image) {
+        return;
+    }
+    
+    /* Copy to pasteboard */
+    NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+    [pasteboard clearContents];
+    [pasteboard writeObjects:@[image]];
 }
 
 #pragma mark - NSWindowDelegate

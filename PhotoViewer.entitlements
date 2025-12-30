@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- App Sandbox - Required for Mac App Store -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    
+    <!-- File Access - User-selected files (Open/Save dialogs) -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    
+    <!-- File Access - Read access to user's Photos folder -->
+    <key>com.apple.security.assets.pictures.read-only</key>
+    <true/>
+    
+    <!-- File Access - Downloads folder (common photo location) -->
+    <key>com.apple.security.files.downloads.read-only</key>
+    <true/>
+    
+    <!-- Hardened Runtime Exceptions -->
+    <!-- Allow loading unsigned libraries (for third-party image codecs if needed) -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <false/>
+    
+    <!-- Allow JIT compilation (not needed for this app) -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <false/>
+    
+    <!-- Allow unsigned executable memory (not needed) -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <false/>
+    
+    <!-- Disable executable page protection (not needed) -->
+    <key>com.apple.security.cs.disable-executable-page-protection</key>
+    <false/>
+    
+    <!-- Allow DYLD environment variables (not needed) -->
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <false/>
+</dict>
+</plist>
+

@@ -5,9 +5,15 @@
 
 #import "AppDelegate.h"
 #import "MainWindowController.h"
+#import "RecentsManager.h"
+
+static const NSInteger kRecentMenuItemTag = 1000;
 
 @interface AppDelegate ()
+
 @property (nonatomic, strong, readwrite) MainWindowController *mainWindowController;
+@property (nonatomic, strong) NSMenu *recentsMenu;
+
 @end
 
 @implementation AppDelegate
@@ -17,6 +23,12 @@
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     [self setupMenuBar];
     [self createMainWindow];
+    
+    /* Listen for recents changes */
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(recentsDidChange:)
+                                                 name:RecentsDidChangeNotification
+                                               object:nil];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
@@ -24,7 +36,7 @@
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
-    /* Cleanup */
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
 - (BOOL)applicationSupportsSecureRestorableState:(NSApplication *)app {
@@ -84,6 +96,16 @@
                         action:@selector(openFolder:)
                  keyEquivalent:@"o"];
     
+    /* Open Recent submenu */
+    NSMenuItem *recentMenuItem = [[NSMenuItem alloc] initWithTitle:@"Open Recent"
+                                                            action:nil
+                                                     keyEquivalent:@""];
+    self.recentsMenu = [[NSMenu alloc] initWithTitle:@"Open Recent"];
+    [recentMenuItem setSubmenu:self.recentsMenu];
+    [fileMenu addItem:recentMenuItem];
+    
+    [self updateRecentsMenu];
+    
     [fileMenu addItem:[NSMenuItem separatorItem]];
     
     [fileMenu addItemWithTitle:@"Close Window"
@@ -92,6 +114,17 @@
     
     [fileMenuItem setSubmenu:fileMenu];
     [mainMenu addItem:fileMenuItem];
+    
+    /* Edit Menu */
+    NSMenuItem *editMenuItem = [[NSMenuItem alloc] init];
+    NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
+    
+    [editMenu addItemWithTitle:@"Copy Image"
+                        action:@selector(copyCurrentPhoto:)
+                 keyEquivalent:@"c"];
+    
+    [editMenuItem setSubmenu:editMenu];
+    [mainMenu addItem:editMenuItem];
     
     /* View Menu */
     NSMenuItem *viewMenuItem = [[NSMenuItem alloc] init];
@@ -168,11 +201,68 @@
     [NSApp setWindowsMenu:windowMenu];
 }
 
+#pragma mark - Recents Menu
+
+- (void)updateRecentsMenu {
+    [self.recentsMenu removeAllItems];
+    
+    RecentsManager *manager = [RecentsManager sharedManager];
+    NSArray *recents = manager.recentFolders;
+    
+    if (recents.count == 0) {
+        NSMenuItem *emptyItem = [[NSMenuItem alloc] initWithTitle:@"No Recent Folders"
+                                                           action:nil
+                                                    keyEquivalent:@""];
+        emptyItem.enabled = NO;
+        [self.recentsMenu addItem:emptyItem];
+    } else {
+        NSInteger index = 0;
+        for (NSString *path in recents) {
+            NSString *displayName = [manager displayNameForPath:path];
+            NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:displayName
+                                                          action:@selector(openRecentFolder:)
+                                                   keyEquivalent:@""];
+            item.target = self;
+            item.tag = kRecentMenuItemTag + index;
+            item.representedObject = path;
+            item.toolTip = path;
+            
+            /* Add folder icon */
+            item.image = [NSImage imageWithSystemSymbolName:@"folder" accessibilityDescription:nil];
+            
+            [self.recentsMenu addItem:item];
+            index++;
+        }
+        
+        [self.recentsMenu addItem:[NSMenuItem separatorItem]];
+        
+        NSMenuItem *clearItem = [[NSMenuItem alloc] initWithTitle:@"Clear Recents"
+                                                           action:@selector(clearRecents:)
+                                                    keyEquivalent:@""];
+        clearItem.target = self;
+        [self.recentsMenu addItem:clearItem];
+    }
+}
+
+- (void)recentsDidChange:(NSNotification *)notification {
+    [self updateRecentsMenu];
+}
+
 #pragma mark - Actions
 
 - (void)openFolder:(id)sender {
     [self.mainWindowController openFolder:sender];
 }
 
-@end
+- (void)openRecentFolder:(NSMenuItem *)sender {
+    NSString *path = sender.representedObject;
+    if (path) {
+        [self.mainWindowController openFolderAtPath:path];
+    }
+}
 
+- (void)clearRecents:(id)sender {
+    [[RecentsManager sharedManager] clearRecents];
+}
+
+@end

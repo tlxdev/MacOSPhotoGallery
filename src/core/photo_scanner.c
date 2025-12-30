@@ -32,6 +32,11 @@ static const char *get_extension(const char *filename) {
 
 /* Internal: Grow collection capacity */
 static bool collection_grow(pv_photo_collection_t *collection) {
+    /* Check for integer overflow before multiplication */
+    if (collection->capacity > SIZE_MAX / 2 / sizeof(pv_photo_t)) {
+        return false;
+    }
+    
     size_t new_capacity = collection->capacity * 2;
     pv_photo_t *new_photos = realloc(collection->photos, new_capacity * sizeof(pv_photo_t));
     if (new_photos == NULL) {
@@ -94,6 +99,17 @@ static int scan_recursive(pv_photo_collection_t *collection, const char *path) {
         char full_path[PV_MAX_PATH];
         int len = snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
         if (len < 0 || (size_t)len >= sizeof(full_path)) {
+            continue;
+        }
+        
+        /* Use lstat to detect symlinks */
+        struct stat lst;
+        if (lstat(full_path, &lst) != 0) {
+            continue;
+        }
+        
+        /* Skip symlinks to prevent infinite loops and security issues */
+        if (S_ISLNK(lst.st_mode)) {
             continue;
         }
         
