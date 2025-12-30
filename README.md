@@ -9,4 +9,6 @@ External dependencies: None
 Requirements: Clang and make
 
 Running:
+```
 make run
+```
