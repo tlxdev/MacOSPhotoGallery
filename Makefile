@@ -33,7 +33,9 @@ OBJC_SOURCES = src/main.m \
                src/views/MetadataPanel.m \
                src/views/ToolbarView.m \
                src/models/PhotoItem.m \
-               src/models/PhotoStore.m
+               src/models/PhotoStore.m \
+               src/utils/Theme.m \
+               src/utils/DateFormatters.m
 
 C_OBJECTS = $(C_SOURCES:.c=.o)
 OBJC_OBJECTS = $(OBJC_SOURCES:.m=.o)

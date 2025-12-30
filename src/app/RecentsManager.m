@@ -1,6 +1,7 @@
 /**
  * RecentsManager.m
  * Manages recently opened folders with NSUserDefaults persistence
+ * Uses immutable patterns for thread safety
  */
 
 #import "RecentsManager.h"
@@ -12,7 +13,8 @@ static const NSUInteger kDefaultMaxRecents = 10;
 
 @interface RecentsManager ()
 
-@property (nonatomic, strong) NSMutableArray<NSString *> *mutableRecentFolders;
+@property (nonatomic, copy) NSArray<NSString *> *recentFoldersStorage;
+@property (nonatomic, strong) dispatch_queue_t syncQueue;
 
 @end
 
@@ -35,6 +37,7 @@ static const NSUInteger kDefaultMaxRecents = 10;
     self = [super init];
     if (self) {
         _maxRecents = kDefaultMaxRecents;
+        _syncQueue = dispatch_queue_create("com.photoviewer.recents", DISPATCH_QUEUE_SERIAL);
         [self loadRecents];
     }
     return self;
@@ -57,27 +60,32 @@ static const NSUInteger kDefaultMaxRecents = 10;
             }
         }
         
-        self.mutableRecentFolders = validPaths;
+        self.recentFoldersStorage = [validPaths copy];
     } else {
-        self.mutableRecentFolders = [NSMutableArray array];
+        self.recentFoldersStorage = @[];
     }
 }
 
 - (void)saveRecents {
-    [[NSUserDefaults standardUserDefaults] setObject:[self.mutableRecentFolders copy] 
+    [[NSUserDefaults standardUserDefaults] setObject:self.recentFoldersStorage
                                               forKey:kRecentsKey];
-    [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
 - (void)notifyChange {
-    [[NSNotificationCenter defaultCenter] postNotificationName:RecentsDidChangeNotification
-                                                        object:self];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:RecentsDidChangeNotification
+                                                            object:self];
+    });
 }
 
 #pragma mark - Properties
 
 - (NSArray<NSString *> *)recentFolders {
-    return [self.mutableRecentFolders copy];
+    __block NSArray *result;
+    dispatch_sync(self.syncQueue, ^{
+        result = self.recentFoldersStorage;
+    });
+    return result;
 }
 
 #pragma mark - Public Methods
@@ -90,19 +98,28 @@ static const NSUInteger kDefaultMaxRecents = 10;
     /* Normalize path */
     NSString *normalizedPath = path.stringByStandardizingPath;
     
-    /* Remove if already exists (will re-add at top) */
-    [self.mutableRecentFolders removeObject:normalizedPath];
-    
-    /* Add to beginning */
-    [self.mutableRecentFolders insertObject:normalizedPath atIndex:0];
-    
-    /* Trim to max size */
-    while (self.mutableRecentFolders.count > self.maxRecents) {
-        [self.mutableRecentFolders removeLastObject];
-    }
-    
-    [self saveRecents];
-    [self notifyChange];
+    dispatch_async(self.syncQueue, ^{
+        /* Create new array without the path (if it exists) */
+        NSMutableArray *newRecents = [NSMutableArray array];
+        [newRecents addObject:normalizedPath];
+        
+        for (NSString *existing in self.recentFoldersStorage) {
+            if (![existing isEqualToString:normalizedPath]) {
+                [newRecents addObject:existing];
+            }
+            
+            /* Stop if we've reached max */
+            if (newRecents.count >= self.maxRecents) {
+                break;
+            }
+        }
+        
+        /* Replace with immutable copy */
+        self.recentFoldersStorage = [newRecents copy];
+        
+        [self saveRecents];
+        [self notifyChange];
+    });
 }
 
 - (void)removeRecentFolder:(NSString *)path {
@@ -111,16 +128,26 @@ static const NSUInteger kDefaultMaxRecents = 10;
     }
     
     NSString *normalizedPath = path.stringByStandardizingPath;
-    [self.mutableRecentFolders removeObject:normalizedPath];
     
-    [self saveRecents];
-    [self notifyChange];
+    dispatch_async(self.syncQueue, ^{
+        /* Create new array without the path */
+        NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(NSString *item, NSDictionary * __unused bindings) {
+            return ![item isEqualToString:normalizedPath];
+        }];
+        
+        self.recentFoldersStorage = [self.recentFoldersStorage filteredArrayUsingPredicate:predicate];
+        
+        [self saveRecents];
+        [self notifyChange];
+    });
 }
 
 - (void)clearRecents {
-    [self.mutableRecentFolders removeAllObjects];
-    [self saveRecents];
-    [self notifyChange];
+    dispatch_async(self.syncQueue, ^{
+        self.recentFoldersStorage = @[];
+        [self saveRecents];
+        [self notifyChange];
+    });
 }
 
 - (NSString *)displayNameForPath:(NSString *)path {
@@ -131,4 +158,3 @@ static const NSUInteger kDefaultMaxRecents = 10;
 }
 
 @end
-

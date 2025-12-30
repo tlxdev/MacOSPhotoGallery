@@ -12,6 +12,7 @@
 #import "../views/MetadataPanel.h"
 #import "../views/ToolbarView.h"
 #import "../views/ThumbnailCache.h"
+#import "../utils/Theme.h"
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 
@@ -73,7 +74,7 @@ static const CGFloat kMetadataPanelWidth = 280.0;
     window.title = @"PhotoViewer";
     window.titlebarAppearsTransparent = YES;
     window.titleVisibility = NSWindowTitleHidden;
-    window.backgroundColor = [NSColor colorWithRed:0.035 green:0.035 blue:0.043 alpha:1.0];
+    window.backgroundColor = [Theme backgroundColor];
     window.minSize = NSMakeSize(kWindowMinWidth, kWindowMinHeight);
     window.delegate = self;
     
@@ -107,7 +108,7 @@ static const CGFloat kMetadataPanelWidth = 280.0;
 - (void)setupViews {
     NSView *contentView = self.window.contentView;
     contentView.wantsLayer = YES;
-    contentView.layer.backgroundColor = [NSColor colorWithRed:0.035 green:0.035 blue:0.043 alpha:1.0].CGColor;
+    contentView.layer.backgroundColor = [Theme backgroundCGColor];
     
     /* Content container */
     self.contentContainer = [[NSView alloc] init];
@@ -200,20 +201,20 @@ static const CGFloat kMetadataPanelWidth = 280.0;
     NSImageView *iconView = [[NSImageView alloc] init];
     iconView.translatesAutoresizingMaskIntoConstraints = NO;
     iconView.image = [NSImage imageWithSystemSymbolName:@"photo.on.rectangle.angled" accessibilityDescription:nil];
-    iconView.contentTintColor = [NSColor colorWithRed:0.055 green:0.647 blue:0.914 alpha:1.0];
+    iconView.contentTintColor = [Theme accentColor];
     iconView.symbolConfiguration = [NSImageSymbolConfiguration configurationWithPointSize:64 weight:NSFontWeightLight];
     [stack addArrangedSubview:iconView];
     
     /* Title */
     NSTextField *title = [NSTextField labelWithString:@"PhotoViewer"];
     title.font = [NSFont systemFontOfSize:28 weight:NSFontWeightLight];
-    title.textColor = [NSColor colorWithWhite:0.95 alpha:1.0];
+    title.textColor = [Theme textColor];
     [stack addArrangedSubview:title];
     
     /* Subtitle */
     NSTextField *subtitle = [NSTextField labelWithString:@"High-performance viewing for your photo library"];
     subtitle.font = [NSFont systemFontOfSize:14 weight:NSFontWeightRegular];
-    subtitle.textColor = [NSColor colorWithWhite:0.5 alpha:1.0];
+    subtitle.textColor = [Theme tertiaryTextColor];
     [stack addArrangedSubview:subtitle];
     
     /* Open button */
@@ -239,7 +240,7 @@ static const CGFloat kMetadataPanelWidth = 280.0;
         /* Recents label */
         NSTextField *recentsLabel = [NSTextField labelWithString:@"Recent Folders"];
         recentsLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
-        recentsLabel.textColor = [NSColor colorWithWhite:0.45 alpha:1.0];
+        recentsLabel.textColor = [Theme tertiaryTextColor];
         [stack addArrangedSubview:recentsLabel];
         
         /* Recents list (show up to 5) */
@@ -254,7 +255,7 @@ static const CGFloat kMetadataPanelWidth = 280.0;
     /* Keyboard hints */
     NSTextField *hints = [NSTextField labelWithString:@"Arrow keys to navigate  |  G for grid  |  I for info"];
     hints.font = [NSFont systemFontOfSize:11 weight:NSFontWeightRegular];
-    hints.textColor = [NSColor colorWithWhite:0.4 alpha:1.0];
+    hints.textColor = [Theme tertiaryTextColor];
     [stack addArrangedSubview:hints];
     
     [NSLayoutConstraint activateConstraints:@[
@@ -285,7 +286,7 @@ static const CGFloat kMetadataPanelWidth = 280.0;
     /* Folder name */
     button.title = path.lastPathComponent;
     button.font = [NSFont systemFontOfSize:13 weight:NSFontWeightRegular];
-    button.contentTintColor = [NSColor colorWithWhite:0.7 alpha:1.0];
+    button.contentTintColor = [Theme secondaryTextColor];
     
     /* Store path and set action */
     button.toolTip = path;

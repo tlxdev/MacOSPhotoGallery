@@ -5,6 +5,7 @@
 
 #import "PhotoItem.h"
 #import <ImageIO/ImageIO.h>
+#import "../utils/DateFormatters.h"
 
 @interface PhotoItem ()
 
@@ -126,18 +127,7 @@
 }
 
 - (NSDate *)parseExifDate:(NSString *)dateString {
-    if (!dateString) {
-        return nil;
-    }
-    
-    static NSDateFormatter *formatter = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        formatter = [[NSDateFormatter alloc] init];
-        formatter.dateFormat = @"yyyy:MM:dd HH:mm:ss";
-    });
-    
-    return [formatter dateFromString:dateString];
+    return [DateFormatters dateFromExifString:dateString];
 }
 
 + (NSString *)formattedFileSize:(uint64_t)bytes {

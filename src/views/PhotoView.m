@@ -6,6 +6,7 @@
 #import "PhotoView.h"
 #import "../models/PhotoStore.h"
 #import "../models/PhotoItem.h"
+#import "../utils/Theme.h"
 
 static const CGFloat kZoomStep = 1.5;
 static const CGFloat kMinZoom = 0.1;
@@ -42,6 +43,7 @@ static const CGFloat kMaxZoom = 10.0;
 @property (nonatomic, strong) NSScrollView *scrollView;
 @property (nonatomic, strong) NSImageView *imageView;
 @property (nonatomic, strong) NSProgressIndicator *loadingIndicator;
+@property (nonatomic, strong) NSTextField *errorLabel;
 @property (nonatomic, copy) NSString *currentPath;
 
 @end
@@ -59,7 +61,7 @@ static const CGFloat kMaxZoom = 10.0;
 
 - (void)setupViews {
     self.wantsLayer = YES;
-    self.layer.backgroundColor = [NSColor colorWithRed:0.035 green:0.035 blue:0.043 alpha:1.0].CGColor;
+    self.layer.backgroundColor = [Theme backgroundCGColor];
     
     /* Scroll view for zoom/pan */
     self.scrollView = [[NSScrollView alloc] initWithFrame:self.bounds];
@@ -68,7 +70,7 @@ static const CGFloat kMaxZoom = 10.0;
     self.scrollView.hasHorizontalScroller = YES;
     self.scrollView.autohidesScrollers = YES;
     self.scrollView.borderType = NSNoBorder;
-    self.scrollView.backgroundColor = [NSColor colorWithRed:0.035 green:0.035 blue:0.043 alpha:1.0];
+    self.scrollView.backgroundColor = [Theme backgroundColor];
     self.scrollView.drawsBackground = YES;
     self.scrollView.allowsMagnification = YES;
     self.scrollView.minMagnification = kMinZoom;
@@ -96,6 +98,15 @@ static const CGFloat kMaxZoom = 10.0;
     self.loadingIndicator.hidden = YES;
     [self addSubview:self.loadingIndicator];
     
+    /* Error label */
+    self.errorLabel = [NSTextField labelWithString:@""];
+    self.errorLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.errorLabel.font = [NSFont systemFontOfSize:14 weight:NSFontWeightMedium];
+    self.errorLabel.textColor = [Theme tertiaryTextColor];
+    self.errorLabel.alignment = NSTextAlignmentCenter;
+    self.errorLabel.hidden = YES;
+    [self addSubview:self.errorLabel];
+    
     /* Layout */
     [NSLayoutConstraint activateConstraints:@[
         [self.scrollView.topAnchor constraintEqualToAnchor:self.topAnchor],
@@ -105,6 +116,11 @@ static const CGFloat kMaxZoom = 10.0;
         
         [self.loadingIndicator.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
         [self.loadingIndicator.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        
+        [self.errorLabel.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+        [self.errorLabel.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [self.errorLabel.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.leadingAnchor constant:20],
+        [self.errorLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.trailingAnchor constant:-20],
     ]];
 }
 
@@ -114,6 +130,7 @@ static const CGFloat kMaxZoom = 10.0;
     PhotoItem *photo = [self.photoStore currentPhoto];
     if (!photo) {
         self.imageView.image = nil;
+        self.errorLabel.hidden = YES;
         return;
     }
     
@@ -124,15 +141,37 @@ static const CGFloat kMaxZoom = 10.0;
     
     self.currentPath = photo.path;
     
-    /* Show loading */
+    /* Hide error, show loading */
+    self.errorLabel.hidden = YES;
     self.loadingIndicator.hidden = NO;
     [self.loadingIndicator startAnimation:nil];
     
     /* Load image asynchronously */
     NSString *path = photo.path;
+    NSString *fileName = photo.name;
+    
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
         NSURL *url = [NSURL fileURLWithPath:path];
-        NSImage *image = [[NSImage alloc] initWithContentsOfURL:url];
+        
+        /* Check if file exists first */
+        NSFileManager *fm = [NSFileManager defaultManager];
+        BOOL fileExists = [fm fileExistsAtPath:path];
+        
+        NSImage *image = nil;
+        NSString *errorMessage = nil;
+        
+        if (!fileExists) {
+            errorMessage = [NSString stringWithFormat:@"File not found: %@", fileName];
+        } else if (![fm isReadableFileAtPath:path]) {
+            errorMessage = [NSString stringWithFormat:@"Cannot read file: %@", fileName];
+        } else {
+            image = [[NSImage alloc] initWithContentsOfURL:url];
+            if (!image) {
+                /* Try to determine if it's a format issue */
+                NSString *extension = path.pathExtension.lowercaseString;
+                errorMessage = [NSString stringWithFormat:@"Unable to load image: %@\nFormat '%@' may be unsupported or file is corrupted", fileName, extension];
+            }
+        }
         
         dispatch_async(dispatch_get_main_queue(), ^{
             /* Verify still current photo */
@@ -145,6 +184,7 @@ static const CGFloat kMaxZoom = 10.0;
             
             if (image) {
                 self.imageView.image = image;
+                self.errorLabel.hidden = YES;
                 
                 /* Size image view to image size */
                 NSSize imageSize = image.size;
@@ -153,6 +193,11 @@ static const CGFloat kMaxZoom = 10.0;
                 /* Reset magnification and fit */
                 [self.scrollView setMagnification:1.0];
                 [self zoomToFit];
+            } else {
+                /* Show error message */
+                self.imageView.image = nil;
+                self.errorLabel.stringValue = errorMessage ?: @"Unable to load image";
+                self.errorLabel.hidden = NO;
             }
         });
     });

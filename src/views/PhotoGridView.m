@@ -8,6 +8,7 @@
 #import "../models/PhotoStore.h"
 #import "../models/PhotoItem.h"
 #import "../app/MainWindowController.h"
+#import "../utils/Theme.h"
 
 static NSString * const kCellIdentifier = @"PhotoCell";
 static const CGFloat kThumbnailSize = 180.0;
@@ -30,7 +31,7 @@ static const CGFloat kSpacing = 4.0;
     self.view.wantsLayer = YES;
     self.view.layer.cornerRadius = 8.0;
     self.view.layer.masksToBounds = YES;
-    self.view.layer.backgroundColor = [NSColor colorWithWhite:0.12 alpha:1.0].CGColor;
+    self.view.layer.backgroundColor = [Theme gridCellBackgroundColor].CGColor;
     
     /* Thumbnail image */
     self.thumbnailView = [[NSImageView alloc] initWithFrame:self.view.bounds];
@@ -66,7 +67,7 @@ static const CGFloat kSpacing = 4.0;
     
     if (selected) {
         self.view.layer.borderWidth = 3.0;
-        self.view.layer.borderColor = [NSColor colorWithRed:0.055 green:0.647 blue:0.914 alpha:1.0].CGColor;
+        self.view.layer.borderColor = [Theme selectionBorderColor].CGColor;
     } else {
         self.view.layer.borderWidth = 0;
     }
@@ -133,7 +134,7 @@ static const CGFloat kSpacing = 4.0;
 
 - (void)setupViews {
     self.wantsLayer = YES;
-    self.layer.backgroundColor = [NSColor colorWithRed:0.035 green:0.035 blue:0.043 alpha:1.0].CGColor;
+    self.layer.backgroundColor = [Theme backgroundCGColor];
     
     /* Flow layout */
     NSCollectionViewFlowLayout *layout = [[NSCollectionViewFlowLayout alloc] init];

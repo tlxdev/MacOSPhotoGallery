@@ -36,7 +36,16 @@ static void fsEventsCallback(
     (void)eventFlags;
     (void)eventIds;
     
+    /* Guard against null context (can happen during dealloc) */
+    if (!clientCallBackInfo) {
+        return;
+    }
+    
     FSEventContext *context = (FSEventContext *)clientCallBackInfo;
+    if (!context->photoStore) {
+        return;
+    }
+    
     PhotoStore *store = (__bridge PhotoStore *)context->photoStore;
     
     /* Notify on main thread */
@@ -86,6 +95,10 @@ static void fsEventsCallback(
 }
 
 - (void)dealloc {
+    /* Clear context pointer before stopping to prevent callback from accessing deallocated object */
+    if (self.eventContext) {
+        self.eventContext->photoStore = NULL;
+    }
     [self stopWatchingFolder];
 }
 

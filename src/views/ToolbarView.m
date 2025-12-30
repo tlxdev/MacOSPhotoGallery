@@ -7,6 +7,7 @@
 #import "../app/MainWindowController.h"
 #import "../models/PhotoStore.h"
 #import "../models/PhotoItem.h"
+#import "../utils/Theme.h"
 
 static const CGFloat kButtonSize = 32.0;
 static const CGFloat kButtonSpacing = 4.0;
@@ -43,7 +44,7 @@ static const CGFloat kButtonSpacing = 4.0;
 
 - (void)setupViews {
     self.wantsLayer = YES;
-    self.layer.backgroundColor = [NSColor colorWithRed:0.035 green:0.035 blue:0.043 alpha:0.9].CGColor;
+    self.layer.backgroundColor = [[Theme backgroundColor] colorWithAlphaComponent:0.9].CGColor;
     
     /* Left stack */
     NSStackView *leftStack = [[NSStackView alloc] init];
@@ -62,7 +63,7 @@ static const CGFloat kButtonSpacing = 4.0;
     self.folderButton.imagePosition = NSImageLeft;
     self.folderButton.title = @"Open Folder";
     self.folderButton.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
-    self.folderButton.contentTintColor = [NSColor colorWithWhite:0.85 alpha:1.0];
+    self.folderButton.contentTintColor = [Theme textColor];
     self.folderButton.target = self.controller;
     self.folderButton.action = @selector(openFolder:);
     self.folderButton.lineBreakMode = NSLineBreakByTruncatingTail;
@@ -75,14 +76,14 @@ static const CGFloat kButtonSpacing = 4.0;
     /* Photo count */
     self.photoCountLabel = [NSTextField labelWithString:@""];
     self.photoCountLabel.font = [NSFont systemFontOfSize:12 weight:NSFontWeightRegular];
-    self.photoCountLabel.textColor = [NSColor colorWithWhite:0.5 alpha:1.0];
+    self.photoCountLabel.textColor = [Theme tertiaryTextColor];
     [leftStack addArrangedSubview:self.photoCountLabel];
     
     /* Center - index label */
     self.indexLabel = [NSTextField labelWithString:@""];
     self.indexLabel.translatesAutoresizingMaskIntoConstraints = NO;
     self.indexLabel.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
-    self.indexLabel.textColor = [NSColor colorWithWhite:0.5 alpha:1.0];
+    self.indexLabel.textColor = [Theme tertiaryTextColor];
     self.indexLabel.alignment = NSTextAlignmentCenter;
     [self addSubview:self.indexLabel];
     
@@ -129,7 +130,7 @@ static const CGFloat kButtonSpacing = 4.0;
     button.bordered = NO;
     button.image = [NSImage imageWithSystemSymbolName:symbolName accessibilityDescription:nil];
     button.symbolConfiguration = [NSImageSymbolConfiguration configurationWithPointSize:14 weight:NSFontWeightRegular];
-    button.contentTintColor = [NSColor colorWithWhite:0.7 alpha:1.0];
+    button.contentTintColor = [Theme buttonTintColor];
     button.target = self.controller;
     button.action = action;
     
@@ -165,15 +166,15 @@ static const CGFloat kButtonSpacing = 4.0;
 - (void)updateForViewMode {
     BOOL isGrid = self.controller.isGridViewVisible;
     self.gridButton.contentTintColor = isGrid ? 
-        [NSColor colorWithRed:0.055 green:0.647 blue:0.914 alpha:1.0] :
-        [NSColor colorWithWhite:0.7 alpha:1.0];
+        [Theme accentColor] :
+        [Theme buttonTintColor];
 }
 
 - (void)updateForMetadataVisibility {
     BOOL isVisible = self.controller.isMetadataVisible;
     self.infoButton.contentTintColor = isVisible ?
-        [NSColor colorWithRed:0.055 green:0.647 blue:0.914 alpha:1.0] :
-        [NSColor colorWithWhite:0.7 alpha:1.0];
+        [Theme accentColor] :
+        [Theme buttonTintColor];
 }
 
 @end

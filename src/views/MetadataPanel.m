@@ -6,6 +6,8 @@
 #import "MetadataPanel.h"
 #import "../models/PhotoStore.h"
 #import "../models/PhotoItem.h"
+#import "../utils/Theme.h"
+#import "../utils/DateFormatters.h"
 
 /* Flipped view for top-to-bottom layout */
 @interface FlippedView : NSView
@@ -39,7 +41,7 @@
 
 - (void)setupViews {
     self.wantsLayer = YES;
-    self.layer.backgroundColor = [NSColor colorWithRed:0.075 green:0.075 blue:0.085 alpha:1.0].CGColor;
+    self.layer.backgroundColor = [Theme panelBackgroundCGColor];
     
     /* Scroll view */
     self.scrollView = [[NSScrollView alloc] initWithFrame:self.bounds];
@@ -47,7 +49,7 @@
     self.scrollView.hasVerticalScroller = YES;
     self.scrollView.autohidesScrollers = YES;
     self.scrollView.borderType = NSNoBorder;
-    self.scrollView.backgroundColor = [NSColor colorWithRed:0.075 green:0.075 blue:0.085 alpha:1.0];
+    self.scrollView.backgroundColor = [Theme panelBackgroundColor];
     self.scrollView.drawsBackground = YES;
     [self addSubview:self.scrollView];
     
@@ -98,7 +100,7 @@
     /* File name header */
     NSTextField *nameLabel = [NSTextField labelWithString:photo.name];
     nameLabel.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
-    nameLabel.textColor = [NSColor colorWithWhite:0.9 alpha:1.0];
+    nameLabel.textColor = [Theme textColor];
     nameLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
     [self.contentStack addArrangedSubview:nameLabel];
     
@@ -168,7 +170,7 @@
 - (void)addSectionTitle:(NSString *)title {
     NSTextField *label = [NSTextField labelWithString:title];
     label.font = [NSFont systemFontOfSize:10 weight:NSFontWeightSemibold];
-    label.textColor = [NSColor colorWithWhite:0.45 alpha:1.0];
+    label.textColor = [Theme tertiaryTextColor];
     [self.contentStack addArrangedSubview:label];
 }
 
@@ -184,13 +186,13 @@
     
     NSTextField *label = [NSTextField labelWithString:labelText];
     label.font = [NSFont systemFontOfSize:12 weight:NSFontWeightRegular];
-    label.textColor = [NSColor colorWithWhite:0.5 alpha:1.0];
+    label.textColor = [Theme tertiaryTextColor];
     [label setContentHuggingPriority:NSLayoutPriorityDefaultHigh 
                       forOrientation:NSLayoutConstraintOrientationHorizontal];
     
     NSTextField *valueField = [NSTextField labelWithString:value];
     valueField.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
-    valueField.textColor = [NSColor colorWithWhite:0.85 alpha:1.0];
+    valueField.textColor = [Theme secondaryTextColor];
     valueField.alignment = NSTextAlignmentRight;
     valueField.lineBreakMode = NSLineBreakByTruncatingMiddle;
     [valueField setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow 
@@ -210,19 +212,7 @@
 }
 
 - (NSString *)formatDate:(NSDate *)date {
-    if (!date) {
-        return nil;
-    }
-    
-    static NSDateFormatter *formatter = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        formatter = [[NSDateFormatter alloc] init];
-        formatter.dateStyle = NSDateFormatterMediumStyle;
-        formatter.timeStyle = NSDateFormatterShortStyle;
-    });
-    
-    return [formatter stringFromDate:date];
+    return [DateFormatters displayStringFromDate:date];
 }
 
 @end
