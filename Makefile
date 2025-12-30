@@ -1,4 +1,4 @@
-# PhotoViewer - Native macOS Application
+# PhotoViewer - Native macOS Application (Swift + C)
 # Build with: make
 # Sign with: make sign IDENTITY="Developer ID Application: Your Name"
 # Notarize: make notarize
@@ -13,36 +13,41 @@ CONTENTS_DIR = $(APP_BUNDLE)/Contents
 MACOS_DIR = $(CONTENTS_DIR)/MacOS
 RESOURCES_DIR = $(CONTENTS_DIR)/Resources
 
+# Compilers
 CC = clang
-OBJC = clang
+SWIFTC = swiftc
 
-# Compiler flags
-CFLAGS = -Wall -Wextra -Werror -std=c17 -O2 -fmodules
-OBJCFLAGS = -Wall -Wextra -std=gnu17 -O2 -fmodules -fobjc-arc
-LDFLAGS = -framework Cocoa -framework Quartz -framework ImageIO -framework UniformTypeIdentifiers -framework CoreServices
+# C flags
+CFLAGS = -Wall -Wextra -Werror -std=c17 -O2 -mmacosx-version-min=14.0
 
-# Source files
+# Swift flags
+SWIFT_FLAGS = -O -whole-module-optimization \
+              -import-objc-header src/swift/PhotoViewer-Bridging-Header.h \
+              -target arm64-apple-macos14.0 \
+              -sdk $(shell xcrun --show-sdk-path)
+
+# Frameworks
+FRAMEWORKS = -framework Cocoa -framework Quartz -framework ImageIO \
+             -framework UniformTypeIdentifiers -framework CoreServices \
+             -framework SwiftUI
+
+# C source files
 C_SOURCES = src/core/photo_scanner.c
-OBJC_SOURCES = src/main.m \
-               src/app/AppDelegate.m \
-               src/app/MainWindowController.m \
-               src/app/RecentsManager.m \
-               src/views/PhotoView.m \
-               src/views/PhotoGridView.m \
-               src/views/ThumbnailCache.m \
-               src/views/MetadataPanel.m \
-               src/views/ToolbarView.m \
-               src/models/PhotoItem.m \
-               src/models/PhotoStore.m \
-               src/utils/Theme.m \
-               src/utils/DateFormatters.m
+
+# Swift source files
+SWIFT_SOURCES = src/swift/PhotoViewerApp.swift \
+                src/swift/Models/PhotoItem.swift \
+                src/swift/Models/PhotoStore.swift \
+                src/swift/Views/ContentView.swift \
+                src/swift/Views/WelcomeView.swift \
+                src/swift/Views/PhotoDisplayView.swift \
+                src/swift/Views/PhotoGridView.swift \
+                src/swift/Views/MetadataPanel.swift \
+                src/swift/Views/ThumbnailCache.swift
 
 C_OBJECTS = $(C_SOURCES:.c=.o)
-OBJC_OBJECTS = $(OBJC_SOURCES:.m=.o)
-ALL_OBJECTS = $(C_OBJECTS) $(OBJC_OBJECTS)
 
-# Code signing identity (set via environment or command line)
-# Example: make sign IDENTITY="Developer ID Application: Your Name (TEAMID)"
+# Code signing identity
 IDENTITY ?= -
 ENTITLEMENTS = PhotoViewer.entitlements
 
@@ -50,31 +55,32 @@ ENTITLEMENTS = PhotoViewer.entitlements
 
 all: $(APP_BUNDLE)
 
-# Debug build with symbols
+# Debug build
 debug: CFLAGS += -g -O0 -DDEBUG
-debug: OBJCFLAGS += -g -O0 -DDEBUG
+debug: SWIFT_FLAGS = -g -Onone -import-objc-header src/swift/PhotoViewer-Bridging-Header.h \
+                     -target arm64-apple-macos14.0 -sdk $(shell xcrun --show-sdk-path)
 debug: $(APP_BUNDLE)
 
-# Release build with optimizations
+# Release build
 release: CFLAGS += -O3 -DNDEBUG
-release: OBJCFLAGS += -O3 -DNDEBUG
 release: $(APP_BUNDLE)
 
-$(APP_BUNDLE): $(ALL_OBJECTS) Info.plist $(ENTITLEMENTS)
+# Build app bundle
+$(APP_BUNDLE): $(C_OBJECTS) $(SWIFT_SOURCES) Info.plist $(ENTITLEMENTS)
 	@mkdir -p $(MACOS_DIR)
 	@mkdir -p $(RESOURCES_DIR)
-	$(CC) $(ALL_OBJECTS) $(LDFLAGS) -o $(MACOS_DIR)/$(APP_NAME)
+	@echo "Compiling Swift sources..."
+	$(SWIFTC) $(SWIFT_FLAGS) $(C_OBJECTS) $(SWIFT_SOURCES) \
+		$(FRAMEWORKS) \
+		-o $(MACOS_DIR)/$(APP_NAME)
 	@cp Info.plist $(CONTENTS_DIR)/
 	@cp -r resources/* $(RESOURCES_DIR)/ 2>/dev/null || true
 	@echo "Built $(APP_BUNDLE)"
 
+# Compile C sources
 %.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
-
-%.o: %.m
-	@mkdir -p $(dir $@)
-	$(OBJC) $(OBJCFLAGS) -c $< -o $@
 
 clean:
 	rm -rf $(BUILD_DIR)
@@ -83,7 +89,7 @@ clean:
 run: $(APP_BUNDLE)
 	open $(APP_BUNDLE)
 
-# Code signing with hardened runtime (required for notarization)
+# Code signing with hardened runtime
 sign: $(APP_BUNDLE)
 	@echo "Signing $(APP_BUNDLE) with identity: $(IDENTITY)"
 	codesign --force --deep --sign "$(IDENTITY)" \
@@ -93,10 +99,8 @@ sign: $(APP_BUNDLE)
 		$(APP_BUNDLE)
 	@echo "Verifying signature..."
 	codesign --verify --verbose=2 $(APP_BUNDLE)
-	@echo "Checking hardened runtime..."
-	codesign -d --entitlements :- $(APP_BUNDLE)
 
-# Ad-hoc signing for local testing (no notarization)
+# Ad-hoc signing for local testing
 sign-adhoc: $(APP_BUNDLE)
 	@echo "Ad-hoc signing $(APP_BUNDLE)..."
 	codesign --force --deep --sign - \
@@ -116,8 +120,7 @@ dmg: sign
 	codesign --sign "$(IDENTITY)" $(BUILD_DIR)/$(APP_NAME).dmg
 	@echo "Created $(BUILD_DIR)/$(APP_NAME).dmg"
 
-# Submit for notarization (requires Apple Developer account)
-# Set APPLE_ID, TEAM_ID, and APP_PASSWORD environment variables
+# Submit for notarization
 notarize: dmg
 	@echo "Submitting for notarization..."
 	xcrun notarytool submit $(BUILD_DIR)/$(APP_NAME).dmg \
@@ -129,7 +132,7 @@ notarize: dmg
 	xcrun stapler staple $(BUILD_DIR)/$(APP_NAME).dmg
 	@echo "Notarization complete!"
 
-# Staple after notarization (if done separately)
+# Staple after notarization
 staple:
 	xcrun stapler staple $(BUILD_DIR)/$(APP_NAME).dmg
 	xcrun stapler staple $(APP_BUNDLE)
