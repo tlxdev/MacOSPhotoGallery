@@ -77,6 +77,9 @@
 /* Buffer size for getattrlistbulk */
 #define ATTR_BUFFER_SIZE (PV_ATTR_BATCH_SIZE * 512)
 
+/* SECURITY: Maximum directory recursion depth to prevent stack exhaustion */
+#define PV_MAX_RECURSION_DEPTH 100
+
 /* ============================================================================
  * Extension Matching - SIMD Optimized
  * ============================================================================ */
@@ -304,7 +307,9 @@ static bool collection_grow(pv_photo_collection_t *collection) {
     return true;
 }
 
-/* Thread-safe addition using mutex */
+/* Thread-safe addition using mutex
+ * SECURITY: All writes happen while holding the lock to prevent race conditions
+ */
 static inline bool collection_add_locked(
     pv_photo_collection_t *collection,
     const char *path,
@@ -332,6 +337,12 @@ static inline bool collection_add_locked(
         return false;
     }
     
+    /* Validate name_offset won't exceed path buffer */
+    if (name_offset >= PV_MAX_PATH) {
+        PV_LOG_ERROR("name_offset %zu exceeds max path", name_offset);
+        return false;
+    }
+    
     pthread_mutex_t *lock = (pthread_mutex_t *)collection->_internal_lock;
     
     int lock_result = pthread_mutex_lock(lock);
@@ -340,9 +351,15 @@ static inline bool collection_add_locked(
         return false;
     }
     
-    /* Check capacity */
+    /* Check capacity and grow if needed */
     if (PV_UNLIKELY(collection->count >= collection->capacity)) {
-        /* Grow the array */
+        /* Check for integer overflow before multiplication */
+        if (collection->capacity > SIZE_MAX / 2 / sizeof(pv_photo_t)) {
+            PV_LOG_ERROR("Capacity overflow: cannot grow collection");
+            pthread_mutex_unlock(lock);
+            return false;
+        }
+        
         const size_t new_capacity = collection->capacity * 2;
         
         PV_LOG_DEBUG("Growing collection from %zu to %zu", collection->capacity, new_capacity);
@@ -363,22 +380,26 @@ static inline bool collection_add_locked(
     }
     
     const size_t slot = collection->count++;
-    pthread_mutex_unlock(lock);
-    
     pv_photo_t *photo = &collection->photos[slot];
+    
+    /* SECURITY: All writes happen while holding the lock to prevent
+     * race condition where another thread resizes the array */
     
     /* Zero the struct first */
     memset(photo, 0, sizeof(pv_photo_t));
     
-    /* Copy path */
+    /* Copy path with bounds checking */
     const size_t copy_len = (path_len < PV_MAX_PATH - 1) ? path_len : PV_MAX_PATH - 1;
     memcpy(photo->path, path, copy_len);
     photo->path[copy_len] = '\0';
     
+    /* Ensure name_offset is within the copied path */
+    const size_t safe_name_offset = (name_offset <= copy_len) ? name_offset : copy_len;
+    
     /* Set metadata */
     photo->path_len = (uint16_t)copy_len;
-    photo->name_offset = (uint32_t)name_offset;
-    photo->name_len = (uint16_t)name_len;
+    photo->name_offset = (uint32_t)safe_name_offset;
+    photo->name_len = (uint16_t)((name_len <= copy_len - safe_name_offset) ? name_len : copy_len - safe_name_offset);
     photo->size = size;
     photo->created_time = created;
     photo->modified_time = modified;
@@ -387,6 +408,9 @@ static inline bool collection_add_locked(
     /* Compute extension hash for fast filtering */
     const char *ext = get_extension(photo->path + photo->name_offset);
     photo->ext_hash = hash_extension_fast(ext, strlen(ext));
+    
+    /* Release lock after all writes complete */
+    pthread_mutex_unlock(lock);
     
     return true;
 }
@@ -541,7 +565,13 @@ static int scan_directory_batch_safe(
                 const char *ext = get_extension(name);
                 
                 if (is_supported_extension(ext)) {
-                    /* Build full path */
+                    /* Build full path with overflow check */
+                    /* SECURITY: Check for integer overflow in path length calculation */
+                    if (dir_path_len > SIZE_MAX - 2 - name_len) {
+                        PV_LOG_ERROR("Path length overflow");
+                        entry_ptr += entry_length;
+                        continue;
+                    }
                     const size_t full_path_len = dir_path_len + 1 + name_len;
                     
                     if (full_path_len < PV_MAX_PATH) {
@@ -821,13 +851,24 @@ void pv_collection_free(pv_photo_collection_t *collection) {
         return;
     }
     
+    /* SECURITY: Clear sensitive pointers before freeing to help detect use-after-free */
     if (collection->_internal_lock != NULL) {
         pthread_mutex_t *lock = (pthread_mutex_t *)collection->_internal_lock;
         pthread_mutex_destroy(lock);
         free(lock);
+        collection->_internal_lock = NULL;
     }
     
-    free(collection->photos);
+    if (collection->photos != NULL) {
+        /* Zero out photo data before freeing (defense in depth) */
+        memset(collection->photos, 0, collection->count * sizeof(pv_photo_t));
+        free(collection->photos);
+        collection->photos = NULL;
+    }
+    
+    collection->count = 0;
+    collection->capacity = 0;
+    
     free(collection);
 }
 
@@ -907,6 +948,7 @@ int pv_scan_directory_ex(
                 
                 if (group == NULL) {
                     PV_LOG_ERROR("Failed to create dispatch group");
+                    dispatch_release(queue);  /* SECURITY: Fix memory leak */
                     close(dir_fd);
                     batch_scan_failed = true;
                 } else {
@@ -1086,6 +1128,10 @@ const char *pv_photo_get_path(const pv_photo_t *photo) {
 
 const char *pv_photo_get_name(const pv_photo_t *photo) {
     if (photo == NULL) {
+        return "";
+    }
+    /* SECURITY: Validate name_offset is within path bounds */
+    if (photo->name_offset >= PV_MAX_PATH || photo->name_offset > photo->path_len) {
         return "";
     }
     return photo->path + photo->name_offset;
