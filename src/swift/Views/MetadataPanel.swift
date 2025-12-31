@@ -87,8 +87,8 @@ struct MetadataPanel: View {
             // File info
             MetadataSection(title: "FILE") {
                 MetadataRow(label: "Size", value: PhotoItem.formattedFileSize(photo.fileSize))
-                MetadataRow(label: "Created", value: formatDate(photo.createdDate))
-                MetadataRow(label: "Modified", value: formatDate(photo.modifiedDate))
+                MetadataRow(label: "Created", value: DateFormatters.formatForDisplay(photo.createdDate))
+                MetadataRow(label: "Modified", value: DateFormatters.formatForDisplay(photo.modifiedDate))
             }
             
             // Image info
@@ -104,7 +104,7 @@ struct MetadataPanel: View {
                         MetadataRow(label: "Color Space", value: colorSpace)
                     }
                     if let dateTaken = photo.dateTaken {
-                        MetadataRow(label: "Date Taken", value: formatDate(dateTaken))
+                        MetadataRow(label: "Date Taken", value: DateFormatters.formatForDisplay(dateTaken))
                     }
                 }
             }
@@ -154,13 +154,6 @@ struct MetadataPanel: View {
         } else {
             photo = nil
         }
-    }
-    
-    private func formatDate(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .short
-        return formatter.string(from: date)
     }
 }
 
@@ -213,4 +206,3 @@ struct GlassDivider: View {
             .frame(height: 1)
     }
 }
-

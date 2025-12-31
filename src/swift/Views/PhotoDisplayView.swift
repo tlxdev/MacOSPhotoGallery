@@ -7,25 +7,6 @@
 import SwiftUI
 import AppKit
 
-// MARK: - Sendable Conformance
-
-extension NSImage: @retroactive @unchecked Sendable {}
-
-// MARK: - Image Load Result
-
-struct ImageLoadResult: @unchecked Sendable {
-    let image: NSImage?
-    let error: String?
-    
-    static func success(_ image: NSImage) -> ImageLoadResult {
-        ImageLoadResult(image: image, error: nil)
-    }
-    
-    static func failure(_ error: String) -> ImageLoadResult {
-        ImageLoadResult(image: nil, error: error)
-    }
-}
-
 struct PhotoDisplayView: View {
     @EnvironmentObject var photoStore: PhotoStore
     @State private var image: NSImage?
@@ -161,12 +142,10 @@ struct PhotoDisplayView: View {
         
         // Check cache first
         Task {
-            if let cached = await ImageCache.shared.image(for: path) {
+            if let cached = await ImageCacheManager.shared.fullSizeImage(for: path) {
                 image = cached
                 errorMessage = nil
-                scale = 1.0
-                offset = .zero
-                lastOffset = .zero
+                resetZoom()
                 return
             }
             
@@ -174,13 +153,15 @@ struct PhotoDisplayView: View {
         }
     }
     
-    private func startLoading(path: String) {
-        errorMessage = nil
-        
-        // Reset zoom when changing photos
+    private func resetZoom() {
         scale = 1.0
         offset = .zero
         lastOffset = .zero
+    }
+    
+    private func startLoading(path: String) {
+        errorMessage = nil
+        resetZoom()
         
         // Debounce loading indicator - only show after 150ms
         loadingDebounceTask = Task {
@@ -190,9 +171,9 @@ struct PhotoDisplayView: View {
             }
         }
         
-        // Load image on background thread
+        // Load image using the unified cache manager
         loadingTask = Task {
-            let result = await loadImageFromDisk(at: path)
+            let result = await ImageCacheManager.shared.loadFullSizeImage(at: path)
             
             guard !Task.isCancelled else { return }
             
@@ -201,7 +182,6 @@ struct PhotoDisplayView: View {
             showLoading = false
             
             if let loadedImage = result.image {
-                await ImageCache.shared.setImage(loadedImage, for: path)
                 image = loadedImage
                 errorMessage = nil
             } else {
@@ -219,106 +199,34 @@ struct PhotoDisplayView: View {
         
         Task.detached(priority: .utility) {
             // Preload next images
-            for offset in 1...preloadRange {
-                let nextIndex = index + offset
+            for preloadOffset in 1...preloadRange {
+                let nextIndex = index + preloadOffset
                 if nextIndex < count {
                     let path = photos[nextIndex].path
-                    let cached = await ImageCache.shared.image(for: path)
+                    let cached = await ImageCacheManager.shared.fullSizeImage(for: path)
                     if cached == nil {
                         let result = await loadImageFromDisk(at: path)
                         if let img = result.image {
-                            await ImageCache.shared.setImage(img, for: path)
+                            await ImageCacheManager.shared.setFullSizeImage(img, for: path)
                         }
                     }
                 }
             }
             
             // Preload previous images
-            for offset in 1...preloadRange {
-                let prevIndex = index - offset
+            for preloadOffset in 1...preloadRange {
+                let prevIndex = index - preloadOffset
                 if prevIndex >= 0 {
                     let path = photos[prevIndex].path
-                    let cached = await ImageCache.shared.image(for: path)
+                    let cached = await ImageCacheManager.shared.fullSizeImage(for: path)
                     if cached == nil {
                         let result = await loadImageFromDisk(at: path)
                         if let img = result.image {
-                            await ImageCache.shared.setImage(img, for: path)
+                            await ImageCacheManager.shared.setFullSizeImage(img, for: path)
                         }
                     }
                 }
             }
         }
-    }
-}
-
-// MARK: - Image Loading
-
-@Sendable
-private func loadImageFromDisk(at path: String) async -> ImageLoadResult {
-    await withCheckedContinuation { continuation in
-        DispatchQueue.global(qos: .userInitiated).async {
-            let fileManager = FileManager.default
-            
-            guard fileManager.fileExists(atPath: path) else {
-                continuation.resume(returning: .failure("File not found"))
-                return
-            }
-            
-            guard fileManager.isReadableFile(atPath: path) else {
-                continuation.resume(returning: .failure("Cannot read file"))
-                return
-            }
-            
-            let url = URL(fileURLWithPath: path)
-            guard let loadedImage = NSImage(contentsOf: url) else {
-                continuation.resume(returning: .failure("Unable to load image"))
-                return
-            }
-            
-            continuation.resume(returning: .success(loadedImage))
-        }
-    }
-}
-
-// MARK: - Image Cache
-
-actor ImageCache {
-    static let shared = ImageCache()
-    
-    private var cache: [String: NSImage] = [:]
-    private var accessOrder: [String] = []
-    private let maxSize = 20 // Keep 20 images in cache
-    
-    func image(for path: String) -> NSImage? {
-        if let img = cache[path] {
-            // Move to end of access order (LRU)
-            if let index = accessOrder.firstIndex(of: path) {
-                accessOrder.remove(at: index)
-                accessOrder.append(path)
-            }
-            return img
-        }
-        return nil
-    }
-    
-    func setImage(_ image: NSImage, for path: String) {
-        // Already cached
-        if cache[path] != nil {
-            return
-        }
-        
-        // Evict oldest if at capacity
-        while cache.count >= maxSize, let oldest = accessOrder.first {
-            cache.removeValue(forKey: oldest)
-            accessOrder.removeFirst()
-        }
-        
-        cache[path] = image
-        accessOrder.append(path)
-    }
-    
-    func clear() {
-        cache.removeAll()
-        accessOrder.removeAll()
     }
 }

@@ -9,9 +9,9 @@ import AppKit
 struct PhotoGridView: View {
     @EnvironmentObject var photoStore: PhotoStore
     
-    let spacing: CGFloat = 4
-    let padding: CGFloat = 4
-    let minCellSize: CGFloat = 150
+    private let spacing: CGFloat = 4
+    private let padding: CGFloat = 4
+    private let minCellSize: CGFloat = 150
     
     var body: some View {
         GeometryReader { geometry in
@@ -98,43 +98,20 @@ struct PhotoGridCell: View {
         .onHover { hovering in
             isHovering = hovering
         }
-        .onAppear {
-            loadThumbnail()
+        .task {
+            await loadThumbnail()
         }
     }
     
-    private func loadThumbnail() {
+    private func loadThumbnail() async {
         let path = photo.path
         let thumbnailSize = max(size * 2, 400) // Retina, minimum 400px
         
-        DispatchQueue.global(qos: .userInitiated).async {
-            let thumb = Self.generateThumbnail(for: path, size: thumbnailSize)
-            
-            DispatchQueue.main.async {
-                self.thumbnail = thumb
-                self.isLoading = false
-            }
+        let thumb = await ImageCacheManager.shared.generateThumbnail(for: path, size: thumbnailSize)
+        
+        await MainActor.run {
+            self.thumbnail = thumb
+            self.isLoading = false
         }
-    }
-    
-    private static nonisolated func generateThumbnail(for path: String, size: CGFloat) -> NSImage? {
-        let url = URL(fileURLWithPath: path)
-        
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
-            return nil
-        }
-        
-        let options: [CFString: Any] = [
-            kCGImageSourceThumbnailMaxPixelSize: size,
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceShouldCacheImmediately: true
-        ]
-        
-        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
-            return nil
-        }
-        
-        return NSImage(cgImage: cgImage, size: .zero)
     }
 }

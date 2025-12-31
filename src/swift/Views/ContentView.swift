@@ -8,6 +8,7 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject var photoStore: PhotoStore
     @State private var indexInput: String = "1"
+    @State private var eventMonitor: Any?
     @FocusState private var isIndexFieldFocused: Bool
     
     var body: some View {
@@ -28,6 +29,11 @@ struct ContentView: View {
         .animation(.spring(response: 0.5, dampingFraction: 0.8), value: photoStore.photos.isEmpty)
         .onAppear {
             setupKeyboardHandling()
+            AppLogger.info("ContentView appeared", category: .ui)
+        }
+        .onDisappear {
+            cleanupKeyboardHandling()
+            AppLogger.info("ContentView disappeared", category: .ui)
         }
         .onChange(of: photoStore.selectedIndex) { _, newIndex in
             // Sync input field when index changes externally
@@ -141,7 +147,7 @@ struct ContentView: View {
                 }
                 
                 titleBarButton(icon: "square.and.arrow.up") {
-                    // Share
+                    shareCurrentPhoto()
                 }
             }
             .padding(.trailing, 12)
@@ -226,8 +232,20 @@ struct ContentView: View {
         .buttonStyle(.plain)
     }
     
+    private func shareCurrentPhoto() {
+        guard let photo = photoStore.currentPhoto else { return }
+        
+        let url = URL(fileURLWithPath: photo.path)
+        let sharingPicker = NSSharingServicePicker(items: [url])
+        
+        if let window = NSApp.keyWindow,
+           let contentView = window.contentView {
+            sharingPicker.show(relativeTo: .zero, of: contentView, preferredEdge: .minY)
+        }
+    }
+    
     private func setupKeyboardHandling() {
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [self] event in
             // Don't intercept if text field is focused
             guard !isIndexFieldFocused else { return event }
             guard !photoStore.photos.isEmpty else { return event }
@@ -264,6 +282,15 @@ struct ContentView: View {
                 break
             }
             return event
+        }
+        AppLogger.debug("Keyboard event monitor installed", category: .ui)
+    }
+    
+    private func cleanupKeyboardHandling() {
+        if let monitor = eventMonitor {
+            NSEvent.removeMonitor(monitor)
+            eventMonitor = nil
+            AppLogger.debug("Keyboard event monitor removed", category: .ui)
         }
     }
 }

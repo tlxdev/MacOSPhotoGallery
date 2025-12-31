@@ -36,6 +36,7 @@ class PhotoStore: ObservableObject {
     // MARK: - Initialization
     init() {
         loadRecents()
+        AppLogger.info("PhotoStore initialized", category: .photoStore)
     }
     
     // MARK: - Folder Operations
@@ -53,7 +54,10 @@ class PhotoStore: ObservableObject {
     }
     
     func openFolder(at path: String) {
-        guard !isScanning else { return }
+        guard !isScanning else {
+            AppLogger.warning("Scan already in progress, ignoring request", category: .photoStore)
+            return
+        }
         
         // Validate path
         let fileManager = FileManager.default
@@ -62,12 +66,14 @@ class PhotoStore: ObservableObject {
               isDirectory.boolValue,
               fileManager.isReadableFile(atPath: path) else {
             errorMessage = "Cannot access folder: \(path)"
+            AppLogger.error("Cannot access folder: \(path)", category: .photoStore)
             return
         }
         
         isScanning = true
         errorMessage = nil
         folderPath = path
+        AppLogger.info("Starting folder scan: \(path)", category: .photoStore)
         
         Task { [weak self] in
             guard let self = self else { return }
@@ -77,17 +83,22 @@ class PhotoStore: ObservableObject {
             self.selectedIndex = 0
             self.isScanning = false
             self.addToRecents(path)
+            AppLogger.info("Scan complete: found \(scannedPhotos.count) photos", category: .photoStore)
         }
     }
     
     private nonisolated func scanDirectory(path: String) -> [PhotoItem] {
         guard let collection = pv_collection_create() else {
+            AppLogger.error("Failed to create photo collection", category: .photoStore)
             return []
         }
         defer { pv_collection_free(collection) }
         
         let count = pv_scan_directory(collection, path)
-        guard count > 0 else { return [] }
+        guard count > 0 else {
+            AppLogger.info("No photos found in directory", category: .photoStore)
+            return []
+        }
         
         var items: [PhotoItem] = []
         items.reserveCapacity(Int(collection.pointee.count))
@@ -150,21 +161,19 @@ class PhotoStore: ObservableObject {
             var isDir: ObjCBool = false
             return fileManager.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
         }
+        AppLogger.debug("Loaded \(recentFolders.count) recent folders", category: .photoStore)
     }
     
     private func addToRecents(_ path: String) {
-        var recents = recentFolders.filter { $0 != path }
-        recents.insert(path, at: 0)
-        if recents.count > maxRecents {
-            recents = Array(recents.prefix(maxRecents))
-        }
-        recentFolders = recents
-        UserDefaults.standard.set(recents, forKey: userDefaultsKey)
+        let recents = [path] + recentFolders.filter { $0 != path }.prefix(maxRecents - 1)
+        recentFolders = Array(recents)
+        UserDefaults.standard.set(recentFolders, forKey: userDefaultsKey)
     }
     
     func clearRecents() {
         recentFolders = []
         UserDefaults.standard.removeObject(forKey: userDefaultsKey)
+        AppLogger.info("Cleared recent folders", category: .photoStore)
     }
     
     // MARK: - Photo Operations
@@ -177,11 +186,15 @@ class PhotoStore: ObservableObject {
         guard let photo = currentPhoto else { return }
         
         let url = URL(fileURLWithPath: photo.path)
-        guard let image = NSImage(contentsOf: url) else { return }
+        guard let image = NSImage(contentsOf: url) else {
+            AppLogger.warning("Failed to load image for copy: \(photo.path)", category: .photoStore)
+            return
+        }
         
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.writeObjects([image])
+        AppLogger.debug("Copied photo to clipboard: \(photo.name)", category: .photoStore)
     }
     
     func showInFinder() {
@@ -189,4 +202,3 @@ class PhotoStore: ObservableObject {
         NSWorkspace.shared.selectFile(photo.path, inFileViewerRootedAtPath: "")
     }
 }
-

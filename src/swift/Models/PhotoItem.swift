@@ -14,7 +14,7 @@ struct PhotoItem: Identifiable, Hashable {
     let fileSize: UInt64
     let createdDate: Date
     let modifiedDate: Date
-    var index: Int
+    let index: Int
     
     // Lazy-loaded metadata
     private(set) var dimensions: CGSize = .zero
@@ -64,7 +64,7 @@ struct PhotoItem: Identifiable, Hashable {
         // EXIF data
         if let exif = properties[kCGImagePropertyExifDictionary as String] as? [String: Any] {
             if let exposure = exif[kCGImagePropertyExifExposureTime as String] as? Double {
-                exposureTime = formatExposureTime(exposure)
+                exposureTime = Self.formatExposureTime(exposure)
             }
             if let fNum = exif[kCGImagePropertyExifFNumber as String] as? Double {
                 fNumber = String(format: "f/%.1f", fNum)
@@ -77,7 +77,7 @@ struct PhotoItem: Identifiable, Hashable {
                 focalLength = String(format: "%.0fmm", focal)
             }
             if let dateString = exif[kCGImagePropertyExifDateTimeOriginal as String] as? String {
-                dateTaken = parseExifDate(dateString)
+                dateTaken = DateFormatters.parseExifDate(dateString)
             }
         }
         
@@ -90,20 +90,13 @@ struct PhotoItem: Identifiable, Hashable {
         metadataLoaded = true
     }
     
-    private func formatExposureTime(_ value: Double) -> String {
+    private static func formatExposureTime(_ value: Double) -> String {
         if value >= 1.0 {
             return String(format: "%.1fs", value)
         } else if value > 0 {
             return String(format: "1/%.0fs", 1.0 / value)
         }
         return ""
-    }
-    
-    private func parseExifDate(_ dateString: String) -> Date? {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        return formatter.date(from: dateString)
     }
     
     static func formattedFileSize(_ bytes: UInt64) -> String {
@@ -130,6 +123,3 @@ struct PhotoItem: Identifiable, Hashable {
         lhs.path == rhs.path
     }
 }
-
-
-

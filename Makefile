@@ -12,6 +12,7 @@ APP_BUNDLE = $(BUILD_DIR)/$(APP_NAME).app
 CONTENTS_DIR = $(APP_BUNDLE)/Contents
 MACOS_DIR = $(CONTENTS_DIR)/MacOS
 RESOURCES_DIR = $(CONTENTS_DIR)/Resources
+TEST_BUILD_DIR = $(BUILD_DIR)/tests
 
 # Compilers
 CC = clang
@@ -36,14 +37,23 @@ C_SOURCES = src/core/photo_scanner.c
 
 # Swift source files
 SWIFT_SOURCES = src/swift/PhotoViewerApp.swift \
+                src/swift/Core/Logger.swift \
+                src/swift/Core/LRUCache.swift \
+                src/swift/Core/DateFormatters.swift \
+                src/swift/Core/ImageCache.swift \
                 src/swift/Models/PhotoItem.swift \
                 src/swift/Models/PhotoStore.swift \
                 src/swift/Views/ContentView.swift \
                 src/swift/Views/WelcomeView.swift \
                 src/swift/Views/PhotoDisplayView.swift \
                 src/swift/Views/PhotoGridView.swift \
-                src/swift/Views/MetadataPanel.swift \
-                src/swift/Views/ThumbnailCache.swift
+                src/swift/Views/MetadataPanel.swift
+
+# Test source files
+TEST_SOURCES = tests/LRUCacheTests.swift \
+               tests/DateFormattersTests.swift \
+               tests/PhotoItemTests.swift \
+               tests/TestRunner.swift
 
 C_OBJECTS = $(C_SOURCES:.c=.o)
 
@@ -51,7 +61,7 @@ C_OBJECTS = $(C_SOURCES:.c=.o)
 IDENTITY ?= -
 ENTITLEMENTS = PhotoViewer.entitlements
 
-.PHONY: all clean run sign notarize install debug release
+.PHONY: all clean run sign notarize install debug release test
 
 all: $(APP_BUNDLE)
 
@@ -88,6 +98,26 @@ clean:
 
 run: $(APP_BUNDLE)
 	open $(APP_BUNDLE)
+
+# Run tests
+test: $(C_OBJECTS)
+	@mkdir -p $(TEST_BUILD_DIR)
+	@echo "Building tests..."
+	$(SWIFTC) -g -Onone \
+		-import-objc-header src/swift/PhotoViewer-Bridging-Header.h \
+		-target arm64-apple-macos14.0 \
+		-sdk $(shell xcrun --show-sdk-path) \
+		$(C_OBJECTS) \
+		src/swift/Core/Logger.swift \
+		src/swift/Core/LRUCache.swift \
+		src/swift/Core/DateFormatters.swift \
+		src/swift/Core/ImageCache.swift \
+		src/swift/Models/PhotoItem.swift \
+		$(TEST_SOURCES) \
+		$(FRAMEWORKS) \
+		-o $(TEST_BUILD_DIR)/TestRunner
+	@echo "Running tests..."
+	@$(TEST_BUILD_DIR)/TestRunner
 
 # Code signing with hardened runtime
 sign: $(APP_BUNDLE)
