@@ -7,13 +7,16 @@ import SwiftUI
 import AppKit
 
 struct PhotoGridView: View {
-    @EnvironmentObject var photoStore: PhotoStore
+    @Environment(PhotoStore.self) private var photoStore
+    @Environment(\.imageCache) private var imageCache
     
     private let spacing: CGFloat = 4
     private let padding: CGFloat = 4
     private let minCellSize: CGFloat = 150
     
     var body: some View {
+        @Bindable var photoStore = photoStore
+        
         GeometryReader { geometry in
             let availableWidth = geometry.size.width - (padding * 2)
             let columnsCount = max(2, Int(availableWidth / minCellSize))
@@ -26,7 +29,7 @@ struct PhotoGridView: View {
                 ScrollView {
                     LazyVGrid(columns: columns, spacing: spacing) {
                         ForEach(Array(photoStore.photos.enumerated()), id: \.element.id) { index, photo in
-                            PhotoGridCell(photo: photo, isSelected: index == photoStore.selectedIndex, size: cellSize)
+                            PhotoGridCell(photo: photo, isSelected: index == photoStore.selectedIndex, size: cellSize, imageCache: imageCache)
                                 .id(photo.id)
                                 .onTapGesture {
                                     photoStore.select(index: index)
@@ -54,6 +57,7 @@ struct PhotoGridCell: View {
     let photo: PhotoItem
     let isSelected: Bool
     let size: CGFloat
+    let imageCache: ImageCacheManager
     
     @State private var thumbnail: NSImage?
     @State private var isLoading = true
@@ -107,7 +111,7 @@ struct PhotoGridCell: View {
         let path = photo.path
         let thumbnailSize = max(size * 2, 400) // Retina, minimum 400px
         
-        let thumb = await ImageCacheManager.shared.generateThumbnail(for: path, size: thumbnailSize)
+        let thumb = await imageCache.generateThumbnail(for: path, size: thumbnailSize)
         
         await MainActor.run {
             self.thumbnail = thumb

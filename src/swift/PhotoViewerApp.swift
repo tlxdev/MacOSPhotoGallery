@@ -1,6 +1,7 @@
 /**
  * PhotoViewerApp.swift
  * Main app entry point with SwiftUI lifecycle
+ * Uses @Observable for modern state management
  */
 
 import SwiftUI
@@ -8,12 +9,12 @@ import SwiftUI
 @main
 struct PhotoViewerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    @StateObject private var photoStore = PhotoStore()
+    @State private var photoStore = PhotoStore()
     
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .environmentObject(photoStore)
+                .environment(photoStore)
                 .frame(minWidth: 900, minHeight: 600)
         }
         .windowStyle(.hiddenTitleBar)
@@ -21,7 +22,7 @@ struct PhotoViewerApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("Open Folder...") {
-                    photoStore.openFolderPanel()
+                    photoStore.presentFolderPicker()
                 }
                 .keyboardShortcut("o", modifiers: .command)
             }

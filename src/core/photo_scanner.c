@@ -128,7 +128,9 @@ static int scan_recursive(pv_photo_collection_t *collection, const char *path) {
             /* Add image file */
             pv_photo_t photo = {0};
             strncpy(photo.path, full_path, sizeof(photo.path) - 1);
+            photo.path[sizeof(photo.path) - 1] = '\0';  /* Ensure null-termination */
             strncpy(photo.name, entry->d_name, sizeof(photo.name) - 1);
+            photo.name[sizeof(photo.name) - 1] = '\0';  /* Ensure null-termination */
             photo.size = (uint64_t)st.st_size;
             photo.created_time = st.st_birthtime;
             photo.modified_time = st.st_mtime;
@@ -177,6 +179,7 @@ int pv_scan_directory(pv_photo_collection_t *collection, const char *directory_p
     /* Reset collection */
     collection->count = 0;
     strncpy(collection->root_path, directory_path, sizeof(collection->root_path) - 1);
+    collection->root_path[sizeof(collection->root_path) - 1] = '\0';  /* Ensure null-termination */
     
     int result = scan_recursive(collection, directory_path);
     

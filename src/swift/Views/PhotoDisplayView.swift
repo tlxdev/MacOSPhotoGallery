@@ -8,7 +8,8 @@ import SwiftUI
 import AppKit
 
 struct PhotoDisplayView: View {
-    @EnvironmentObject var photoStore: PhotoStore
+    @Environment(PhotoStore.self) private var photoStore
+    @Environment(\.imageCache) private var imageCache
     @State private var image: NSImage?
     @State private var showLoading = false
     @State private var errorMessage: String?
@@ -139,10 +140,11 @@ struct PhotoDisplayView: View {
         }
         
         let path = photo.path
+        let cache = imageCache
         
         // Check cache first
         Task {
-            if let cached = await ImageCacheManager.shared.fullSizeImage(for: path) {
+            if let cached = await cache.fullSizeImage(for: path) {
                 image = cached
                 errorMessage = nil
                 resetZoom()
@@ -163,6 +165,8 @@ struct PhotoDisplayView: View {
         errorMessage = nil
         resetZoom()
         
+        let cache = imageCache
+        
         // Debounce loading indicator - only show after 150ms
         loadingDebounceTask = Task {
             try? await Task.sleep(nanoseconds: 150_000_000) // 150ms
@@ -173,7 +177,7 @@ struct PhotoDisplayView: View {
         
         // Load image using the unified cache manager
         loadingTask = Task {
-            let result = await ImageCacheManager.shared.loadFullSizeImage(at: path)
+            let result = await cache.loadFullSizeImage(at: path)
             
             guard !Task.isCancelled else { return }
             
@@ -192,10 +196,11 @@ struct PhotoDisplayView: View {
     }
     
     private func preloadAdjacentImages(around index: Int) {
-        // Capture the photos array
+        // Capture the photos array and cache reference
         let photos = photoStore.photos
         let count = photos.count
         let preloadRange = 5
+        let cache = imageCache
         
         Task.detached(priority: .utility) {
             // Preload next images
@@ -203,11 +208,11 @@ struct PhotoDisplayView: View {
                 let nextIndex = index + preloadOffset
                 if nextIndex < count {
                     let path = photos[nextIndex].path
-                    let cached = await ImageCacheManager.shared.fullSizeImage(for: path)
+                    let cached = await cache.fullSizeImage(for: path)
                     if cached == nil {
                         let result = await loadImageFromDisk(at: path)
                         if let img = result.image {
-                            await ImageCacheManager.shared.setFullSizeImage(img, for: path)
+                            await cache.setFullSizeImage(img, for: path)
                         }
                     }
                 }
@@ -218,11 +223,11 @@ struct PhotoDisplayView: View {
                 let prevIndex = index - preloadOffset
                 if prevIndex >= 0 {
                     let path = photos[prevIndex].path
-                    let cached = await ImageCacheManager.shared.fullSizeImage(for: path)
+                    let cached = await cache.fullSizeImage(for: path)
                     if cached == nil {
                         let result = await loadImageFromDisk(at: path)
                         if let img = result.image {
-                            await ImageCacheManager.shared.setFullSizeImage(img, for: path)
+                            await cache.setFullSizeImage(img, for: path)
                         }
                     }
                 }

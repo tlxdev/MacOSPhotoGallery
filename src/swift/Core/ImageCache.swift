@@ -1,11 +1,14 @@
 /**
  * ImageCache.swift
  * Unified image and thumbnail cache using LRU eviction
+ * Includes memory pressure handling for automatic cache eviction
  */
 
 import Foundation
 import AppKit
 import ImageIO
+import Dispatch
+import SwiftUI
 
 // MARK: - Sendable Conformance
 
@@ -26,12 +29,80 @@ struct ImageLoadResult: @unchecked Sendable {
     }
 }
 
+// MARK: - Image Cache Protocol (for dependency injection)
+
+protocol ImageCaching: Actor {
+    func fullSizeImage(for path: String) async -> NSImage?
+    func setFullSizeImage(_ image: NSImage, for path: String) async
+    func thumbnail(for path: String) async -> NSImage?
+    func setThumbnail(_ image: NSImage, for path: String) async
+    func generateThumbnail(for path: String, size: CGFloat) async -> NSImage?
+    func loadFullSizeImage(at path: String) async -> ImageLoadResult
+    func clearFullSizeCache() async
+    func clearThumbnailCache() async
+    func clearAll() async
+    func handleMemoryPressure(level: MemoryPressureLevel) async
+}
+
+// MARK: - Memory Pressure Level
+
+enum MemoryPressureLevel: Sendable {
+    case normal
+    case warning
+    case critical
+}
+
+// MARK: - Memory Pressure Monitor
+
+final class MemoryPressureMonitor: @unchecked Sendable {
+    private let memoryPressureSource: DispatchSourceMemoryPressure
+    private let onPressureChange: @Sendable (MemoryPressureLevel) -> Void
+    
+    init(onPressureChange: @escaping @Sendable (MemoryPressureLevel) -> Void) {
+        self.onPressureChange = onPressureChange
+        self.memoryPressureSource = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.warning, .critical],
+            queue: .global(qos: .utility)
+        )
+        
+        memoryPressureSource.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            let event = self.memoryPressureSource.data
+            
+            let level: MemoryPressureLevel
+            if event.contains(.critical) {
+                level = .critical
+            } else if event.contains(.warning) {
+                level = .warning
+            } else {
+                level = .normal
+            }
+            
+            self.onPressureChange(level)
+        }
+        
+        memoryPressureSource.resume()
+        AppLogger.info("Memory pressure monitor started", category: .imageCache)
+    }
+    
+    deinit {
+        memoryPressureSource.cancel()
+    }
+}
+
+
 // MARK: - Unified Image Cache
 
 /// Unified cache for both full-size images and thumbnails
 /// Uses O(1) LRU eviction for optimal performance
-actor ImageCacheManager {
-    static let shared = ImageCacheManager()
+/// Responds to system memory pressure by clearing caches
+actor ImageCacheManager: ImageCaching {
+    static let shared: ImageCacheManager = {
+        let cache = ImageCacheManager()
+        // Set up memory monitoring after creation using a task
+        Task { await cache.startMemoryMonitoring() }
+        return cache
+    }()
     
     /// Cache configuration
     enum CacheConfig {
@@ -41,10 +112,44 @@ actor ImageCacheManager {
     
     private let fullSizeCache: LRUCache<String, NSImage>
     private let thumbnailCache: LRUCache<String, NSImage>
+    private var memoryMonitor: MemoryPressureMonitor?
     
-    private init() {
-        self.fullSizeCache = LRUCache(maxSize: CacheConfig.maxFullSizeImages)
-        self.thumbnailCache = LRUCache(maxSize: CacheConfig.maxThumbnails)
+    init(
+        fullSizeCacheSize: Int = CacheConfig.maxFullSizeImages,
+        thumbnailCacheSize: Int = CacheConfig.maxThumbnails
+    ) {
+        self.fullSizeCache = LRUCache(maxSize: fullSizeCacheSize)
+        self.thumbnailCache = LRUCache(maxSize: thumbnailCacheSize)
+        self.memoryMonitor = nil
+    }
+    
+    /// Starts memory pressure monitoring - called after initialization
+    func startMemoryMonitoring() {
+        guard memoryMonitor == nil else { return }
+        let cache = self
+        self.memoryMonitor = MemoryPressureMonitor { level in
+            Task {
+                await cache.handleMemoryPressure(level: level)
+            }
+        }
+    }
+    
+    // MARK: - Memory Pressure Handling
+    
+    func handleMemoryPressure(level: MemoryPressureLevel) async {
+        switch level {
+        case .normal:
+            break
+        case .warning:
+            // On warning, clear full-size images (largest memory consumers)
+            await fullSizeCache.clear()
+            AppLogger.warning("Memory pressure warning - cleared full-size image cache", category: .imageCache)
+        case .critical:
+            // On critical, clear everything
+            await fullSizeCache.clear()
+            await thumbnailCache.clear()
+            AppLogger.error("Memory pressure critical - cleared all caches", category: .imageCache)
+        }
     }
     
     // MARK: - Full Size Image Operations
@@ -178,5 +283,18 @@ func loadImageFromDisk(at path: String) async -> ImageLoadResult {
         
         return ImageLoadResult.success(loadedImage)
     }.value
+}
+
+// MARK: - Environment Key for Dependency Injection
+
+struct ImageCacheKey: EnvironmentKey {
+    static let defaultValue: ImageCacheManager = .shared
+}
+
+extension EnvironmentValues {
+    var imageCache: ImageCacheManager {
+        get { self[ImageCacheKey.self] }
+        set { self[ImageCacheKey.self] = newValue }
+    }
 }
 

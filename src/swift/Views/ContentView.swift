@@ -1,17 +1,21 @@
 /**
  * ContentView.swift
  * Main content view - unified title bar with content
+ * Uses SwiftUI-native fileImporter and ShareLink
  */
 
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
-    @EnvironmentObject var photoStore: PhotoStore
+    @Environment(PhotoStore.self) private var photoStore
     @State private var indexInput: String = "1"
     @State private var eventMonitor: Any?
     @FocusState private var isIndexFieldFocused: Bool
     
     var body: some View {
+        @Bindable var photoStore = photoStore
+        
         ZStack {
             // Deep background
             Color(red: 0.02, green: 0.02, blue: 0.035)
@@ -27,6 +31,11 @@ struct ContentView: View {
         }
         .ignoresSafeArea()
         .animation(.spring(response: 0.5, dampingFraction: 0.8), value: photoStore.photos.isEmpty)
+        .fileImporter(
+            isPresented: $photoStore.isFileImporterPresented,
+            allowedContentTypes: [.folder],
+            onCompletion: photoStore.handleFolderSelection
+        )
         .onAppear {
             setupKeyboardHandling()
             AppLogger.info("ContentView appeared", category: .ui)
@@ -84,13 +93,15 @@ struct ContentView: View {
     }
     
     private var titleBar: some View {
-        HStack(spacing: 12) {
+        @Bindable var photoStore = photoStore
+        
+        return HStack(spacing: 12) {
             // Left: Space for traffic lights (they're ~70px from left edge)
             Color.clear
                 .frame(width: 78)
             
             // Folder button
-            Button(action: { photoStore.openFolderPanel() }) {
+            Button(action: { photoStore.presentFolderPicker() }) {
                 HStack(spacing: 6) {
                     Image(systemName: "folder.fill")
                         .font(.system(size: 11, weight: .medium))
@@ -146,8 +157,21 @@ struct ContentView: View {
                     photoStore.showInFinder()
                 }
                 
-                titleBarButton(icon: "square.and.arrow.up") {
-                    shareCurrentPhoto()
+                // Share button using ShareLink
+                if let url = photoStore.currentPhotoURL {
+                    ShareLink(item: url) {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.55))
+                            .frame(width: 26, height: 26)
+                    }
+                    .buttonStyle(.plain)
+                } else {
+                    // Disabled share button when no photo
+                    Image(systemName: "square.and.arrow.up")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.25))
+                        .frame(width: 26, height: 26)
                 }
             }
             .padding(.trailing, 12)
@@ -230,18 +254,6 @@ struct ContentView: View {
                 }
         }
         .buttonStyle(.plain)
-    }
-    
-    private func shareCurrentPhoto() {
-        guard let photo = photoStore.currentPhoto else { return }
-        
-        let url = URL(fileURLWithPath: photo.path)
-        let sharingPicker = NSSharingServicePicker(items: [url])
-        
-        if let window = NSApp.keyWindow,
-           let contentView = window.contentView {
-            sharingPicker.show(relativeTo: .zero, of: contentView, preferredEdge: .minY)
-        }
     }
     
     private func setupKeyboardHandling() {

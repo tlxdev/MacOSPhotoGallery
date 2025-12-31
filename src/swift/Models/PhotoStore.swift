@@ -2,23 +2,28 @@
  * PhotoStore.swift
  * Central store managing photo collection, selection, and state
  * Bridges to C scanner for high-performance directory scanning
+ * Uses @Observable for modern SwiftUI integration
  */
 
 import Foundation
 import AppKit
-import Combine
+import Observation
 
+@Observable
 @MainActor
-class PhotoStore: ObservableObject {
-    // MARK: - Published State
-    @Published private(set) var photos: [PhotoItem] = []
-    @Published var selectedIndex: Int = 0
-    @Published private(set) var folderPath: String?
-    @Published private(set) var isScanning: Bool = false
-    @Published var isGridVisible: Bool = false
-    @Published var isInfoVisible: Bool = false
-    @Published private(set) var recentFolders: [String] = []
-    @Published private(set) var errorMessage: String?
+final class PhotoStore {
+    // MARK: - Observable State
+    private(set) var photos: [PhotoItem] = []
+    var selectedIndex: Int = 0
+    private(set) var folderPath: String?
+    private(set) var isScanning: Bool = false
+    var isGridVisible: Bool = false
+    var isInfoVisible: Bool = false
+    private(set) var recentFolders: [String] = []
+    private(set) var errorMessage: String?
+    
+    // State for SwiftUI fileImporter
+    var isFileImporterPresented: Bool = false
     
     // MARK: - Computed Properties
     var photoCount: Int { photos.count }
@@ -31,7 +36,6 @@ class PhotoStore: ObservableObject {
     // MARK: - Private
     private let userDefaultsKey = "RecentFolders"
     private let maxRecents = 10
-    private var fileMonitor: DispatchSourceFileSystemObject?
     
     // MARK: - Initialization
     init() {
@@ -40,16 +44,32 @@ class PhotoStore: ObservableObject {
     }
     
     // MARK: - Folder Operations
-    func openFolderPanel() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.message = "Select a folder containing photos"
-        panel.prompt = "Open"
-        
-        if panel.runModal() == .OK, let url = panel.url {
+    
+    /// Presents the file importer (called from views)
+    func presentFolderPicker() {
+        isFileImporterPresented = true
+    }
+    
+    /// Handle folder selection from fileImporter
+    func handleFolderSelection(result: Result<URL, Error>) {
+        switch result {
+        case .success(let url):
+            // Start accessing the security-scoped resource
+            guard url.startAccessingSecurityScopedResource() else {
+                errorMessage = "Cannot access folder: permission denied"
+                AppLogger.error("Failed to access security-scoped resource: \(url.path)", category: .photoStore)
+                return
+            }
+            
+            // Open the folder
             openFolder(at: url.path)
+            
+            // Stop accessing when done (defer would be too early)
+            // We keep access since we need to read files within
+            
+        case .failure(let error):
+            errorMessage = "Failed to open folder: \(error.localizedDescription)"
+            AppLogger.error("File importer error: \(error)", category: .photoStore)
         }
     }
     
@@ -200,5 +220,11 @@ class PhotoStore: ObservableObject {
     func showInFinder() {
         guard let photo = currentPhoto else { return }
         NSWorkspace.shared.selectFile(photo.path, inFileViewerRootedAtPath: "")
+    }
+    
+    /// Returns the URL for sharing the current photo (for ShareLink)
+    var currentPhotoURL: URL? {
+        guard let photo = currentPhoto else { return nil }
+        return URL(fileURLWithPath: photo.path)
     }
 }

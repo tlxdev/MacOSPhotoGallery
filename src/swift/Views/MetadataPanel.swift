@@ -6,7 +6,7 @@
 import SwiftUI
 
 struct MetadataPanel: View {
-    @EnvironmentObject var photoStore: PhotoStore
+    @Environment(PhotoStore.self) private var photoStore
     @State private var photo: PhotoItem?
     
     var body: some View {

@@ -6,7 +6,7 @@
 import SwiftUI
 
 struct WelcomeView: View {
-    @EnvironmentObject var photoStore: PhotoStore
+    @Environment(PhotoStore.self) private var photoStore
     @State private var isHovering = false
     @State private var appeared = false
     
@@ -60,7 +60,7 @@ struct WelcomeView: View {
                 .opacity(appeared ? 1 : 0)
                 
                 // Open button with glass effect
-                Button(action: { photoStore.openFolderPanel() }) {
+                Button(action: { photoStore.presentFolderPicker() }) {
                     HStack(spacing: 10) {
                         Image(systemName: "folder.badge.plus")
                             .font(.system(size: 16, weight: .medium))
