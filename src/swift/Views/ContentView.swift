@@ -2,6 +2,7 @@
  * ContentView.swift
  * Main content view - unified title bar with content
  * Uses SwiftUI-native fileImporter and ShareLink
+ * Supports native macOS fullscreen mode with hidden controls
  */
 
 import SwiftUI
@@ -11,6 +12,7 @@ struct ContentView: View {
     @Environment(PhotoStore.self) private var photoStore
     @State private var indexInput: String = "1"
     @State private var eventMonitor: Any?
+    @State private var isFullscreen: Bool = false
     @FocusState private var isIndexFieldFocused: Bool
     
     var body: some View {
@@ -18,7 +20,7 @@ struct ContentView: View {
         
         ZStack {
             // Deep background
-            Color(red: 0.02, green: 0.02, blue: 0.035)
+            Color.black
                 .ignoresSafeArea()
             
             // Content
@@ -38,10 +40,12 @@ struct ContentView: View {
         )
         .onAppear {
             setupKeyboardHandling()
+            setupFullscreenObserver()
             AppLogger.info("ContentView appeared", category: .ui)
         }
         .onDisappear {
             cleanupKeyboardHandling()
+            cleanupFullscreenObserver()
             AppLogger.info("ContentView disappeared", category: .ui)
         }
         .onChange(of: photoStore.selectedIndex) { _, newIndex in
@@ -54,6 +58,40 @@ struct ContentView: View {
     
     @ViewBuilder
     private var mainContent: some View {
+        if isFullscreen {
+            // Fullscreen mode: just the image, no controls
+            fullscreenContent
+        } else {
+            // Normal mode: title bar + content + optional panels
+            normalContent
+        }
+    }
+    
+    // MARK: - Fullscreen Content
+    
+    @ViewBuilder
+    private var fullscreenContent: some View {
+        ZStack {
+            // Pure black background
+            Color.black
+                .ignoresSafeArea()
+            
+            // Just the photo display
+            PhotoDisplayView()
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            // Dismiss any focus
+            if isIndexFieldFocused {
+                isIndexFieldFocused = false
+            }
+        }
+    }
+    
+    // MARK: - Normal Content
+    
+    @ViewBuilder
+    private var normalContent: some View {
         VStack(spacing: 0) {
             // Title bar - same height as traffic lights area
             titleBar
@@ -62,6 +100,9 @@ struct ContentView: View {
             HStack(spacing: 0) {
                 // Photo display
                 ZStack {
+                    // Background for non-fullscreen
+                    Color(red: 0.02, green: 0.02, blue: 0.035)
+                    
                     if photoStore.isGridVisible {
                         PhotoGridView()
                             .transition(.asymmetric(
@@ -77,6 +118,13 @@ struct ContentView: View {
                     }
                 }
                 .animation(.spring(response: 0.4, dampingFraction: 0.85), value: photoStore.isGridVisible)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    // Dismiss index field focus when tapping on content area
+                    if isIndexFieldFocused {
+                        isIndexFieldFocused = false
+                    }
+                }
                 
                 // Info panel
                 if photoStore.isInfoVisible {
@@ -256,9 +304,52 @@ struct ContentView: View {
         .buttonStyle(.plain)
     }
     
+    // MARK: - Fullscreen Observer
+    
+    private func setupFullscreenObserver() {
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.willEnterFullScreenNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            withAnimation(.easeInOut(duration: 0.3)) {
+                isFullscreen = true
+            }
+            AppLogger.info("Entered fullscreen mode", category: .ui)
+        }
+        
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.willExitFullScreenNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            withAnimation(.easeInOut(duration: 0.3)) {
+                isFullscreen = false
+            }
+            AppLogger.info("Exited fullscreen mode", category: .ui)
+        }
+    }
+    
+    private func cleanupFullscreenObserver() {
+        NotificationCenter.default.removeObserver(self, name: NSWindow.willEnterFullScreenNotification, object: nil)
+        NotificationCenter.default.removeObserver(self, name: NSWindow.willExitFullScreenNotification, object: nil)
+    }
+    
+    // MARK: - Keyboard Handling
+    
     private func setupKeyboardHandling() {
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [self] event in
-            // Don't intercept if text field is focused
+            // Handle Escape key first - always works to dismiss focus or exit fullscreen
+            if event.keyCode == 53 { // Escape
+                if isIndexFieldFocused {
+                    isIndexFieldFocused = false
+                    return nil
+                }
+                // Let Escape pass through for fullscreen exit (handled by system)
+                return event
+            }
+            
+            // Don't intercept other keys if text field is focused
             guard !isIndexFieldFocused else { return event }
             guard !photoStore.photos.isEmpty else { return event }
             
@@ -269,15 +360,15 @@ struct ContentView: View {
             case 124: // Right arrow
                 photoStore.selectNext()
                 return nil
-            case 5: // G key
-                if !event.modifierFlags.contains(.command) {
+            case 5: // G key - only in non-fullscreen
+                if !isFullscreen && !event.modifierFlags.contains(.command) {
                     withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
                         photoStore.isGridVisible.toggle()
                     }
                     return nil
                 }
-            case 34: // I key
-                if !event.modifierFlags.contains(.command) {
+            case 34: // I key - only in non-fullscreen
+                if !isFullscreen && !event.modifierFlags.contains(.command) {
                     withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
                         photoStore.isInfoVisible.toggle()
                     }
@@ -288,8 +379,6 @@ struct ContentView: View {
                     photoStore.copyCurrentPhoto()
                     return nil
                 }
-            case 53: // Escape
-                return nil
             default:
                 break
             }
