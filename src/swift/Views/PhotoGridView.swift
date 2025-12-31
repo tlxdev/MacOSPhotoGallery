@@ -20,7 +20,7 @@ struct PhotoGridView: View {
     private let minCellSize: CGFloat = 150
     
     // Prefetch buffer - how many rows ahead/behind to prefetch
-    private let prefetchBuffer = 3
+    private let prefetchBuffer = 5  // Increased for smoother scrolling
     
     var body: some View {
         @Bindable var photoStore = photoStore
@@ -124,8 +124,15 @@ struct PhotoGridCell: View {
     let imageCache: ImageCacheManager
     
     @State private var thumbnail: NSImage?
-    @State private var isLoading = true
+    @State private var loadState: LoadState = .initial
     @State private var isHovering = false
+    
+    private enum LoadState {
+        case initial
+        case loading
+        case loaded
+        case failed
+    }
     
     var body: some View {
         ZStack {
@@ -139,8 +146,9 @@ struct PhotoGridCell: View {
                     .resizable()
                     .aspectRatio(contentMode: .fill)
                     .frame(width: size, height: size)
-            } else if isLoading {
-                // Subtle shimmer placeholder instead of spinner for smoother feel
+                    .transition(.opacity.animation(.easeIn(duration: 0.15)))
+            } else if loadState == .loading || loadState == .initial {
+                // Subtle shimmer placeholder
                 Rectangle()
                     .fill(Color(white: 0.12))
             } else {
@@ -166,7 +174,7 @@ struct PhotoGridCell: View {
         .onHover { hovering in
             isHovering = hovering
         }
-        .task(id: photo.id) {
+        .task(id: photo.id, priority: .high) {
             await loadThumbnail()
         }
     }
@@ -175,17 +183,23 @@ struct PhotoGridCell: View {
         let path = photo.path
         let thumbnailSize = size * 2 // Retina
         
-        // Check cache first
+        // Check cache IMMEDIATELY - eager generation may have already created it
         if let cached = await imageCache.thumbnail(for: path) {
             thumbnail = cached
-            isLoading = false
+            loadState = .loaded
             return
         }
+        
+        loadState = .loading
         
         // Generate thumbnail with high priority since we're visible
         let thumb = await imageCache.generateThumbnail(for: path, size: thumbnailSize)
         
-        thumbnail = thumb
-        isLoading = false
+        if let thumb = thumb {
+            thumbnail = thumb
+            loadState = .loaded
+        } else {
+            loadState = .failed
+        }
     }
 }

@@ -95,6 +95,11 @@ final class PhotoStore {
         folderPath = path
         AppLogger.info("Starting folder scan: \(path)", category: .photoStore)
         
+        // Cancel any ongoing eager thumbnail generation from previous folder
+        Task {
+            await ImageCacheManager.shared.cancelEagerGeneration()
+        }
+        
         Task { [weak self] in
             guard let self = self else { return }
             let scannedPhotos = self.scanDirectory(path: path)
@@ -104,52 +109,97 @@ final class PhotoStore {
             self.isScanning = false
             self.addToRecents(path)
             AppLogger.info("Scan complete: found \(scannedPhotos.count) photos", category: .photoStore)
+            
+            // Start eager thumbnail generation in background
+            // This will pre-generate thumbnails so they're instant when grid opens
+            if !scannedPhotos.isEmpty {
+                let paths = scannedPhotos.map(\.path)
+                let thumbnailSize: CGFloat = 320 // Standard grid thumbnail size
+                
+                AppLogger.debug("Starting eager thumbnail generation for \(paths.count) photos", category: .photoStore)
+                
+                Task.detached(priority: .utility) {
+                    await ImageCacheManager.shared.startEagerThumbnailGeneration(
+                        paths: paths,
+                        size: thumbnailSize
+                    )
+                }
+            }
         }
     }
     
     private nonisolated func scanDirectory(path: String) -> [PhotoItem] {
+        AppLogger.debug("scanDirectory called with path: \(path)", category: .photoStore)
+        
+        // Create collection with error handling
+        AppLogger.debug("Creating photo collection...", category: .photoStore)
         guard let collection = pv_collection_create() else {
-            AppLogger.error("Failed to create photo collection", category: .photoStore)
+            AppLogger.error("Failed to create photo collection - pv_collection_create returned nil", category: .photoStore)
             return []
         }
-        defer { pv_collection_free(collection) }
+        AppLogger.debug("Photo collection created successfully", category: .photoStore)
         
+        defer {
+            AppLogger.debug("Freeing photo collection", category: .photoStore)
+            pv_collection_free(collection)
+        }
+        
+        // Scan directory with error handling
+        AppLogger.debug("Starting pv_scan_directory...", category: .photoStore)
         let count = pv_scan_directory(collection, path)
-        guard count > 0 else {
+        AppLogger.debug("pv_scan_directory returned: \(count)", category: .photoStore)
+        
+        if count < 0 {
+            AppLogger.error("pv_scan_directory failed with error code: \(count)", category: .photoStore)
+            return []
+        }
+        
+        if count == 0 {
             AppLogger.info("No photos found in directory", category: .photoStore)
             return []
         }
         
-        var items: [PhotoItem] = []
-        items.reserveCapacity(Int(collection.pointee.count))
+        // Get photo count and build items
+        let photoCount = pv_collection_count(collection)
+        AppLogger.debug("Photo count from collection: \(photoCount)", category: .photoStore)
         
-        for i in 0..<collection.pointee.count {
-            guard let photo = pv_collection_get(collection, i) else { continue }
-            
-            // Access the C struct fields safely using withUnsafePointer
-            let photoPath = withUnsafePointer(to: photo.pointee.path) { ptr in
-                ptr.withMemoryRebound(to: CChar.self, capacity: Int(PV_MAX_PATH)) { charPtr in
-                    String(cString: charPtr)
-                }
+        var items: [PhotoItem] = []
+        items.reserveCapacity(Int(photoCount))
+        
+        for i in 0..<photoCount {
+            guard let photo = pv_collection_get(collection, i) else {
+                AppLogger.warning("pv_collection_get returned nil for index \(i)", category: .photoStore)
+                continue
             }
             
-            let photoName = withUnsafePointer(to: photo.pointee.name) { ptr in
-                ptr.withMemoryRebound(to: CChar.self, capacity: 256) { charPtr in
-                    String(cString: charPtr)
-                }
+            // Use accessor functions for Swift compatibility
+            guard let pathPtr = pv_photo_get_path(photo),
+                  let namePtr = pv_photo_get_name(photo) else {
+                AppLogger.warning("Failed to get path/name for photo at index \(i)", category: .photoStore)
+                continue
+            }
+            
+            let photoPath = String(cString: pathPtr)
+            let photoName = String(cString: namePtr)
+            
+            // Validate the path is not empty
+            if photoPath.isEmpty {
+                AppLogger.warning("Empty path for photo at index \(i)", category: .photoStore)
+                continue
             }
             
             let item = PhotoItem(
                 path: photoPath,
                 name: photoName,
-                fileSize: photo.pointee.size,
-                createdDate: Date(timeIntervalSince1970: TimeInterval(photo.pointee.created_time)),
-                modifiedDate: Date(timeIntervalSince1970: TimeInterval(photo.pointee.modified_time)),
+                fileSize: pv_photo_get_size(photo),
+                createdDate: Date(timeIntervalSince1970: TimeInterval(pv_photo_get_created_time(photo))),
+                modifiedDate: Date(timeIntervalSince1970: TimeInterval(pv_photo_get_modified_time(photo))),
                 index: Int(i)
             )
             items.append(item)
         }
         
+        AppLogger.debug("Successfully built \(items.count) PhotoItems", category: .photoStore)
         return items
     }
     

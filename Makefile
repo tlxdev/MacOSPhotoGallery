@@ -18,8 +18,11 @@ TEST_BUILD_DIR = $(BUILD_DIR)/tests
 CC = clang
 SWIFTC = swiftc
 
-# C flags
-CFLAGS = -Wall -Wextra -Werror -std=c17 -O2 -mmacosx-version-min=14.0
+# C flags - Ultra optimized with SIMD and vectorization
+CFLAGS = -Wall -Wextra -Werror -std=c17 -O3 -mmacosx-version-min=14.0 \
+         -ffast-math -funroll-loops -ftree-vectorize \
+         -march=native -flto \
+         -DNDEBUG
 
 # Swift flags
 SWIFT_FLAGS = -O -whole-module-optimization \
@@ -71,8 +74,12 @@ debug: SWIFT_FLAGS = -g -Onone -import-objc-header src/swift/PhotoViewer-Bridgin
                      -target arm64-apple-macos14.0 -sdk $(shell xcrun --show-sdk-path)
 debug: $(APP_BUNDLE)
 
-# Release build
-release: CFLAGS += -O3 -DNDEBUG
+# Release build - Maximum performance
+release: CFLAGS = -Wall -Wextra -Werror -std=c17 -O3 -mmacosx-version-min=14.0 \
+                  -ffast-math -funroll-loops -ftree-vectorize \
+                  -march=native -flto=full \
+                  -fomit-frame-pointer -fno-stack-protector \
+                  -DNDEBUG
 release: $(APP_BUNDLE)
 
 # Build app bundle

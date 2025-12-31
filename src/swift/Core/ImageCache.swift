@@ -124,10 +124,11 @@ final class MemoryPressureMonitor: @unchecked Sendable {
 // MARK: - Unified Image Cache
 
 /// Ultra high-performance image cache
-/// - Large caches (50 full-size, 2000 thumbnails)
-/// - Display-sized loading with subsampling
-/// - Parallel preloading with priority
-/// - Memory pressure handling
+/// - Large caches (50 full-size, 5000 thumbnails)
+/// - Eager thumbnail pre-generation on folder scan
+/// - EXIF embedded thumbnail extraction for instant preview
+/// - High parallelism with concurrency control
+/// - Priority queue for visible cells
 actor ImageCacheManager: ImageCaching {
     static let shared: ImageCacheManager = {
         let cache = ImageCacheManager()
@@ -137,10 +138,12 @@ actor ImageCacheManager: ImageCaching {
     
     /// Cache configuration - LARGE for instant loading
     enum CacheConfig {
-        static let maxFullSizeImages = 50      // 50 display-sized images
-        static let maxThumbnails = 2000        // 2000 thumbnails for smooth grid scrolling
+        static let maxFullSizeImages = 50           // 50 display-sized images
+        static let maxThumbnails = 5000             // 5000 thumbnails for smooth grid scrolling
         static let defaultDisplayMaxDimension: CGFloat = 3840  // 4K max
-        static let parallelLoadCount = 4       // Parallel preload operations
+        static let parallelLoadCount = 4            // Parallel full-size preload operations
+        static let thumbnailParallelCount = 16      // High parallelism for thumbnails
+        static let eagerPreloadBatchSize = 200      // How many thumbnails to pre-generate immediately
     }
     
     private let fullSizeCache: LRUCache<String, NSImage>
@@ -150,6 +153,10 @@ actor ImageCacheManager: ImageCaching {
     // Preloading state
     private var preloadTasks: [String: Task<Void, Never>] = [:]
     private let preloadQueue = DispatchQueue(label: "com.photoviewer.preload", qos: .userInitiated, attributes: .concurrent)
+    
+    // Eager thumbnail generation state
+    private var eagerGenerationTask: Task<Void, Never>?
+    private var priorityPaths: Set<String> = []  // Paths that should be loaded with high priority
     
     init(
         fullSizeCacheSize: Int = CacheConfig.maxFullSizeImages,
@@ -309,18 +316,39 @@ actor ImageCacheManager: ImageCaching {
         }
     }
     
-    /// Prefetch thumbnails in batch - for grid view
+    /// Prefetch thumbnails in batch - for grid view (with concurrency limit)
     func prefetchThumbnails(paths: [String], size: CGFloat) async {
+        // Use a limited number of concurrent operations
+        // First filter out already cached paths
+        var uncachedPaths: [String] = []
+        for path in paths {
+            if !(await self.thumbnailCache.contains(path)) {
+                uncachedPaths.append(path)
+            }
+        }
+        
+        guard !uncachedPaths.isEmpty else { return }
+        
+        // Mark these as priority paths
+        for path in uncachedPaths {
+            self.priorityPaths.insert(path)
+        }
+        
         await withTaskGroup(of: Void.self) { group in
-            for path in paths {
-                // Skip if cached
-                if await thumbnailCache.contains(path) {
-                    continue
+            var inFlight = 0
+            
+            for path in uncachedPaths {
+                // Limit concurrency
+                if inFlight >= CacheConfig.thumbnailParallelCount {
+                    await group.next()
+                    inFlight -= 1
                 }
                 
+                inFlight += 1
                 let cache = self
+                
                 group.addTask {
-                    let thumb = await Task.detached(priority: .medium) {
+                    let thumb = await Task.detached(priority: .high) {
                         Self.createOptimizedThumbnail(for: path, size: size)
                     }.value
                     
@@ -330,6 +358,97 @@ actor ImageCacheManager: ImageCaching {
                 }
             }
         }
+        
+        // Clear priority paths
+        for path in uncachedPaths {
+            self.priorityPaths.remove(path)
+        }
+    }
+    
+    // MARK: - Eager Thumbnail Pre-Generation
+    
+    /// Start eager thumbnail generation for all photos in background
+    /// Call this immediately after folder scan completes
+    func startEagerThumbnailGeneration(paths: [String], size: CGFloat) {
+        // Cancel any existing eager generation
+        eagerGenerationTask?.cancel()
+        
+        eagerGenerationTask = Task { [weak self] in
+            guard let self = self else { return }
+            await self.generateThumbnailsEagerly(paths: paths, size: size)
+        }
+    }
+    
+    /// Generate thumbnails eagerly in batches
+    private func generateThumbnailsEagerly(paths: [String], size: CGFloat) async {
+        let batchSize = CacheConfig.eagerPreloadBatchSize
+        let totalPaths = paths
+        
+        // Process in batches to avoid overwhelming the system
+        var processed = 0
+        
+        while processed < totalPaths.count {
+            // Check for cancellation
+            if Task.isCancelled { return }
+            
+            let end = min(processed + batchSize, totalPaths.count)
+            let batch = Array(totalPaths[processed..<end])
+            
+            // Filter out already cached
+            var uncached: [String] = []
+            for path in batch {
+                if !(await self.thumbnailCache.contains(path)) {
+                    uncached.append(path)
+                }
+            }
+            
+            // Skip priority paths - they're being loaded by the UI
+            let nonPriorityPaths = uncached.filter { !self.priorityPaths.contains($0) }
+            
+            if !nonPriorityPaths.isEmpty {
+                // Generate this batch with controlled parallelism
+                await withTaskGroup(of: Void.self) { group in
+                    var inFlight = 0
+                    
+                    for path in nonPriorityPaths {
+                        if Task.isCancelled { return }
+                        
+                        // Limit concurrency
+                        if inFlight >= CacheConfig.thumbnailParallelCount {
+                            await group.next()
+                            inFlight -= 1
+                        }
+                        
+                        inFlight += 1
+                        let cache = self
+                        
+                        group.addTask {
+                            // Use low priority for background generation
+                            let thumb = await Task.detached(priority: .utility) {
+                                Self.createOptimizedThumbnail(for: path, size: size)
+                            }.value
+                            
+                            if let thumb = thumb {
+                                await cache.setThumbnail(thumb, for: path)
+                            }
+                        }
+                    }
+                }
+            }
+            
+            processed = end
+            
+            // Small yield to let UI-triggered loads take priority
+            if processed < totalPaths.count {
+                try? await Task.sleep(nanoseconds: 1_000_000) // 1ms
+            }
+        }
+    }
+    
+    /// Cancel eager generation (e.g., when switching folders)
+    func cancelEagerGeneration() {
+        eagerGenerationTask?.cancel()
+        eagerGenerationTask = nil
     }
     
     // MARK: - Clear Operations
@@ -416,11 +535,29 @@ actor ImageCacheManager: ImageCaching {
             return nil
         }
         
+        // First try: Use embedded thumbnail if available (instant for JPEGs)
+        // This only works if the image has an embedded EXIF thumbnail
+        let embeddedOptions: [CFString: Any] = [
+            kCGImageSourceThumbnailMaxPixelSize: size,
+            kCGImageSourceCreateThumbnailFromImageIfAbsent: false,  // Don't generate, only use embedded
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true
+        ]
+        
+        if let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, embeddedOptions as CFDictionary) {
+            // Check if the embedded thumbnail is big enough
+            if CGFloat(cgImage.width) >= size * 0.5 || CGFloat(cgImage.height) >= size * 0.5 {
+                return NSImage(cgImage: cgImage, size: .zero)
+            }
+        }
+        
+        // Second: Generate thumbnail with subsampling (hardware accelerated)
         let options: [CFString: Any] = [
             kCGImageSourceThumbnailMaxPixelSize: size,
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceShouldCacheImmediately: true
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceSubsampleFactor: 4  // Subsample by 4x for speed
         ]
         
         guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
@@ -428,6 +565,35 @@ actor ImageCacheManager: ImageCaching {
         }
         
         return NSImage(cgImage: cgImage, size: .zero)
+    }
+    
+    /// Extract embedded EXIF thumbnail - extremely fast (no decoding needed)
+    private static nonisolated func extractEmbeddedThumbnail(for path: String) -> NSImage? {
+        let url = URL(fileURLWithPath: path)
+        
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+            return nil
+        }
+        
+        // Get properties including the embedded thumbnail
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let exifDict = properties[kCGImagePropertyExifDictionary] as? [CFString: Any],
+              let thumbnailData = exifDict[kCGImagePropertyExifUserComment] as? Data,
+              let thumbnail = NSImage(data: thumbnailData) else {
+            // Try the TIFF thumbnail
+            let options: [CFString: Any] = [
+                kCGImageSourceThumbnailMaxPixelSize: 320,
+                kCGImageSourceCreateThumbnailFromImageIfAbsent: false,
+                kCGImageSourceShouldCacheImmediately: true
+            ]
+            
+            if let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+                return NSImage(cgImage: cgImage, size: .zero)
+            }
+            return nil
+        }
+        
+        return thumbnail
     }
 }
 
@@ -474,5 +640,30 @@ extension EnvironmentValues {
     var imageCache: ImageCacheManager {
         get { self[ImageCacheKey.self] }
         set { self[ImageCacheKey.self] = newValue }
+    }
+}
+
+// MARK: - Async Array Extensions
+
+extension Array {
+    /// Async filter that processes elements concurrently
+    func asyncFilter(_ isIncluded: @escaping (Element) async -> Bool) async -> [Element] {
+        await withTaskGroup(of: (Int, Bool).self) { group in
+            for (index, element) in self.enumerated() {
+                group.addTask {
+                    let included = await isIncluded(element)
+                    return (index, included)
+                }
+            }
+            
+            var results = [Int: Bool]()
+            for await (index, included) in group {
+                results[index] = included
+            }
+            
+            return self.enumerated().compactMap { index, element in
+                results[index] == true ? element : nil
+            }
+        }
     }
 }
