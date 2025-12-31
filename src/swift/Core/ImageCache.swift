@@ -1,7 +1,13 @@
 /**
  * ImageCache.swift
- * Unified image and thumbnail cache using LRU eviction
- * Includes memory pressure handling for automatic cache eviction
+ * Ultra high-performance image caching system
+ * 
+ * Optimizations:
+ * - Display-sized image loading (downsampled to screen resolution)
+ * - Parallel preloading with priority queue
+ * - Large LRU caches with memory pressure handling
+ * - Batch thumbnail prefetching
+ * - CGImageSource subsampling for instant loading
  */
 
 import Foundation
@@ -9,6 +15,7 @@ import AppKit
 import ImageIO
 import Dispatch
 import SwiftUI
+import QuickLookThumbnailing
 
 // MARK: - Sendable Conformance
 
@@ -29,6 +36,27 @@ struct ImageLoadResult: @unchecked Sendable {
     }
 }
 
+// MARK: - Preload Priority
+
+enum PreloadPriority: Int, Comparable, Sendable {
+    case critical = 0   // Current image
+    case high = 1       // Adjacent images (+/- 1)
+    case medium = 2     // Nearby images (+/- 2-5)
+    case low = 3        // Background prefetch (+/- 6-15)
+    
+    static func < (lhs: PreloadPriority, rhs: PreloadPriority) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+}
+
+// MARK: - Preload Request
+
+struct PreloadRequest: Sendable {
+    let path: String
+    let priority: PreloadPriority
+    let maxDimension: CGFloat
+}
+
 // MARK: - Image Cache Protocol (for dependency injection)
 
 protocol ImageCaching: Actor {
@@ -38,10 +66,13 @@ protocol ImageCaching: Actor {
     func setThumbnail(_ image: NSImage, for path: String) async
     func generateThumbnail(for path: String, size: CGFloat) async -> NSImage?
     func loadFullSizeImage(at path: String) async -> ImageLoadResult
+    func loadDisplayImage(at path: String, maxDimension: CGFloat) async -> ImageLoadResult
     func clearFullSizeCache() async
     func clearThumbnailCache() async
     func clearAll() async
     func handleMemoryPressure(level: MemoryPressureLevel) async
+    func preloadImages(requests: [PreloadRequest]) async
+    func prefetchThumbnails(paths: [String], size: CGFloat) async
 }
 
 // MARK: - Memory Pressure Level
@@ -90,29 +121,35 @@ final class MemoryPressureMonitor: @unchecked Sendable {
     }
 }
 
-
 // MARK: - Unified Image Cache
 
-/// Unified cache for both full-size images and thumbnails
-/// Uses O(1) LRU eviction for optimal performance
-/// Responds to system memory pressure by clearing caches
+/// Ultra high-performance image cache
+/// - Large caches (50 full-size, 2000 thumbnails)
+/// - Display-sized loading with subsampling
+/// - Parallel preloading with priority
+/// - Memory pressure handling
 actor ImageCacheManager: ImageCaching {
     static let shared: ImageCacheManager = {
         let cache = ImageCacheManager()
-        // Set up memory monitoring after creation using a task
         Task { await cache.startMemoryMonitoring() }
         return cache
     }()
     
-    /// Cache configuration
+    /// Cache configuration - LARGE for instant loading
     enum CacheConfig {
-        static let maxFullSizeImages = 20
-        static let maxThumbnails = 500
+        static let maxFullSizeImages = 50      // 50 display-sized images
+        static let maxThumbnails = 2000        // 2000 thumbnails for smooth grid scrolling
+        static let defaultDisplayMaxDimension: CGFloat = 3840  // 4K max
+        static let parallelLoadCount = 4       // Parallel preload operations
     }
     
     private let fullSizeCache: LRUCache<String, NSImage>
     private let thumbnailCache: LRUCache<String, NSImage>
     private var memoryMonitor: MemoryPressureMonitor?
+    
+    // Preloading state
+    private var preloadTasks: [String: Task<Void, Never>] = [:]
+    private let preloadQueue = DispatchQueue(label: "com.photoviewer.preload", qos: .userInitiated, attributes: .concurrent)
     
     init(
         fullSizeCacheSize: Int = CacheConfig.maxFullSizeImages,
@@ -123,7 +160,6 @@ actor ImageCacheManager: ImageCaching {
         self.memoryMonitor = nil
     }
     
-    /// Starts memory pressure monitoring - called after initialization
     func startMemoryMonitoring() {
         guard memoryMonitor == nil else { return }
         let cache = self
@@ -141,14 +177,16 @@ actor ImageCacheManager: ImageCaching {
         case .normal:
             break
         case .warning:
-            // On warning, clear full-size images (largest memory consumers)
-            await fullSizeCache.clear()
-            AppLogger.warning("Memory pressure warning - cleared full-size image cache", category: .imageCache)
+            // On warning, clear half of full-size cache
+            let count = await fullSizeCache.count
+            for _ in 0..<(count / 2) {
+                await fullSizeCache.evictOldest()
+            }
+            AppLogger.warning("Memory pressure warning - reduced full-size cache", category: .imageCache)
         case .critical:
-            // On critical, clear everything
             await fullSizeCache.clear()
-            await thumbnailCache.clear()
-            AppLogger.error("Memory pressure critical - cleared all caches", category: .imageCache)
+            // Keep thumbnails as they're small
+            AppLogger.error("Memory pressure critical - cleared full-size cache", category: .imageCache)
         }
     }
     
@@ -160,7 +198,6 @@ actor ImageCacheManager: ImageCaching {
     
     func setFullSizeImage(_ image: NSImage, for path: String) async {
         await fullSizeCache.set(path, value: image)
-        AppLogger.debug("Cached full-size image: \(path)", category: .imageCache)
     }
     
     // MARK: - Thumbnail Operations
@@ -173,20 +210,17 @@ actor ImageCacheManager: ImageCaching {
         await thumbnailCache.set(path, value: image)
     }
     
-    /// Generate and cache a thumbnail
+    /// Generate thumbnail using CGImageSource subsampling - extremely fast
     func generateThumbnail(for path: String, size: CGFloat = 320) async -> NSImage? {
         // Check cache first
         if let cached = await thumbnailCache.get(path) {
             return cached
         }
         
-        // Generate on background
-        let thumbnail = await withCheckedContinuation { (continuation: CheckedContinuation<NSImage?, Never>) in
-            Task.detached(priority: .utility) {
-                let result = Self.createThumbnail(for: path, size: size)
-                continuation.resume(returning: result)
-            }
-        }
+        // Generate using optimized method
+        let thumbnail = await Task.detached(priority: .userInitiated) {
+            Self.createOptimizedThumbnail(for: path, size: size)
+        }.value
         
         if let thumbnail = thumbnail {
             await thumbnailCache.set(path, value: thumbnail)
@@ -195,23 +229,107 @@ actor ImageCacheManager: ImageCaching {
         return thumbnail
     }
     
-    // MARK: - Image Loading
+    // MARK: - Display Image Loading (Optimized)
     
-    /// Load a full-size image from disk (async, with caching)
-    func loadFullSizeImage(at path: String) async -> ImageLoadResult {
+    /// Load image downsampled to display size - this is the key optimization
+    func loadDisplayImage(at path: String, maxDimension: CGFloat = CacheConfig.defaultDisplayMaxDimension) async -> ImageLoadResult {
         // Check cache
         if let cached = await fullSizeCache.get(path) {
             return .success(cached)
         }
         
-        // Load from disk
-        let result = await loadImageFromDisk(at: path)
+        // Load with subsampling
+        let result = await Task.detached(priority: .userInitiated) {
+            Self.loadSubsampledImage(at: path, maxDimension: maxDimension)
+        }.value
         
         if let image = result.image {
             await fullSizeCache.set(path, value: image)
         }
         
         return result
+    }
+    
+    /// Legacy full-size loading (for compatibility)
+    func loadFullSizeImage(at path: String) async -> ImageLoadResult {
+        await loadDisplayImage(at: path, maxDimension: CacheConfig.defaultDisplayMaxDimension)
+    }
+    
+    // MARK: - Parallel Preloading
+    
+    /// Preload images in parallel with priority
+    func preloadImages(requests: [PreloadRequest]) async {
+        // Sort by priority
+        let sortedRequests = requests.sorted { $0.priority < $1.priority }
+        
+        // Cancel any existing preloads for paths not in new requests
+        let newPaths = Set(requests.map(\.path))
+        for (path, task) in preloadTasks {
+            if !newPaths.contains(path) {
+                task.cancel()
+                preloadTasks.removeValue(forKey: path)
+            }
+        }
+        
+        // Process in parallel batches
+        await withTaskGroup(of: Void.self) { group in
+            var activeCount = 0
+            
+            for request in sortedRequests {
+                // Skip if already cached or loading
+                if await fullSizeCache.contains(request.path) {
+                    continue
+                }
+                if preloadTasks[request.path] != nil {
+                    continue
+                }
+                
+                // Limit parallel loads
+                if activeCount >= CacheConfig.parallelLoadCount {
+                    // Wait for one to complete
+                    await group.next()
+                    activeCount -= 1
+                }
+                
+                activeCount += 1
+                let path = request.path
+                let maxDim = request.maxDimension
+                let cache = self
+                
+                group.addTask {
+                    let result = await Task.detached(priority: request.priority == .critical ? .high : .medium) {
+                        Self.loadSubsampledImage(at: path, maxDimension: maxDim)
+                    }.value
+                    
+                    if let image = result.image {
+                        await cache.setFullSizeImage(image, for: path)
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Prefetch thumbnails in batch - for grid view
+    func prefetchThumbnails(paths: [String], size: CGFloat) async {
+        await withTaskGroup(of: Void.self) { group in
+            for path in paths {
+                // Skip if cached
+                if await thumbnailCache.contains(path) {
+                    continue
+                }
+                
+                let cache = self
+                group.addTask {
+                    let thumb = await Task.detached(priority: .medium) {
+                        Self.createOptimizedThumbnail(for: path, size: size)
+                    }.value
+                    
+                    if let thumb = thumb {
+                        await cache.setThumbnail(thumb, for: path)
+                    }
+                }
+            }
+        }
     }
     
     // MARK: - Clear Operations
@@ -232,13 +350,69 @@ actor ImageCacheManager: ImageCaching {
         AppLogger.info("Cleared all image caches", category: .imageCache)
     }
     
-    // MARK: - Private Helpers
+    // MARK: - Private Optimized Image Loading
     
-    private static nonisolated func createThumbnail(for path: String, size: CGFloat) -> NSImage? {
+    /// Load image with subsampling - loads at reduced resolution from disk
+    /// This is MUCH faster than loading full res and scaling
+    private static nonisolated func loadSubsampledImage(at path: String, maxDimension: CGFloat) -> ImageLoadResult {
         let url = URL(fileURLWithPath: path)
         
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
-            AppLogger.warning("Failed to create image source for thumbnail: \(path)", category: .thumbnailCache)
+            return .failure("Cannot read image file")
+        }
+        
+        // Get original dimensions
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? CGFloat,
+              let height = properties[kCGImagePropertyPixelHeight] as? CGFloat else {
+            // Fallback to regular loading
+            if let image = NSImage(contentsOf: url) {
+                return .success(image)
+            }
+            return .failure("Cannot read image properties")
+        }
+        
+        // Calculate subsample factor
+        let maxOriginal = max(width, height)
+        
+        // If image is smaller than max dimension, load at full size
+        if maxOriginal <= maxDimension {
+            let options: [CFString: Any] = [
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceShouldAllowFloat: true
+            ]
+            
+            if let cgImage = CGImageSourceCreateImageAtIndex(source, 0, options as CFDictionary) {
+                return .success(NSImage(cgImage: cgImage, size: NSSize(width: width, height: height)))
+            }
+        }
+        
+        // Use thumbnail generation with max size - this uses hardware decoding
+        let options: [CFString: Any] = [
+            kCGImageSourceThumbnailMaxPixelSize: maxDimension,
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true
+        ]
+        
+        if let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+            let size = NSSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
+            return .success(NSImage(cgImage: cgImage, size: size))
+        }
+        
+        // Ultimate fallback
+        if let image = NSImage(contentsOf: url) {
+            return .success(image)
+        }
+        
+        return .failure("Failed to decode image")
+    }
+    
+    /// Create thumbnail using CGImageSource - optimized for speed
+    private static nonisolated func createOptimizedThumbnail(for path: String, size: CGFloat) -> NSImage? {
+        let url = URL(fileURLWithPath: path)
+        
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
             return nil
         }
         
@@ -250,7 +424,6 @@ actor ImageCacheManager: ImageCaching {
         ]
         
         guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
-            AppLogger.warning("Failed to generate thumbnail: \(path)", category: .thumbnailCache)
             return nil
         }
         
@@ -258,30 +431,36 @@ actor ImageCacheManager: ImageCaching {
     }
 }
 
-// MARK: - Disk Image Loading
+// MARK: - Legacy Disk Image Loading (for compatibility)
 
 @Sendable
 func loadImageFromDisk(at path: String) async -> ImageLoadResult {
     await Task.detached(priority: .userInitiated) {
-        let fileManager = FileManager.default
+        let url = URL(fileURLWithPath: path)
         
-        guard fileManager.fileExists(atPath: path) else {
-            AppLogger.warning("File not found: \(path)", category: .fileOperations)
-            return ImageLoadResult.failure("File not found")
-        }
-        
-        guard fileManager.isReadableFile(atPath: path) else {
-            AppLogger.warning("Cannot read file: \(path)", category: .fileOperations)
+        // Use optimized subsampled loading
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
             return ImageLoadResult.failure("Cannot read file")
         }
         
-        let url = URL(fileURLWithPath: path)
-        guard let loadedImage = NSImage(contentsOf: url) else {
-            AppLogger.warning("Unable to load image: \(path)", category: .fileOperations)
-            return ImageLoadResult.failure("Unable to load image")
+        let options: [CFString: Any] = [
+            kCGImageSourceThumbnailMaxPixelSize: ImageCacheManager.CacheConfig.defaultDisplayMaxDimension,
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true
+        ]
+        
+        if let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+            let size = NSSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
+            return ImageLoadResult.success(NSImage(cgImage: cgImage, size: size))
         }
         
-        return ImageLoadResult.success(loadedImage)
+        // Fallback
+        if let image = NSImage(contentsOf: url) {
+            return ImageLoadResult.success(image)
+        }
+        
+        return ImageLoadResult.failure("Unable to load image")
     }.value
 }
 
@@ -297,4 +476,3 @@ extension EnvironmentValues {
         set { self[ImageCacheKey.self] = newValue }
     }
 }
-

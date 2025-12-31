@@ -1,7 +1,12 @@
 /**
  * PhotoDisplayView.swift
- * Main photo display with zoom and pan - fills container
- * Includes image preloading and debounced loading indicator
+ * Ultra-optimized photo display with instant loading
+ * 
+ * Optimizations:
+ * - Display-sized image loading (downsampled)
+ * - Aggressive parallel preloading (15 images ahead/behind)
+ * - Priority-based loading (current > adjacent > far)
+ * - Instant cache hits with no loading indicator for cached images
  */
 
 import SwiftUI
@@ -19,6 +24,12 @@ struct PhotoDisplayView: View {
     @State private var lastOffset: CGSize = .zero
     @State private var loadingTask: Task<Void, Never>?
     @State private var loadingDebounceTask: Task<Void, Never>?
+    @State private var preloadTask: Task<Void, Never>?
+    @State private var displayMaxDimension: CGFloat = 3840
+    
+    // Preload configuration - aggressive for instant loading
+    private let preloadAhead = 15      // Preload 15 images ahead
+    private let preloadBehind = 10     // Preload 10 images behind
     
     var body: some View {
         GeometryReader { geometry in
@@ -35,10 +46,17 @@ struct PhotoDisplayView: View {
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
             .clipped()
+            .onAppear {
+                // Calculate appropriate max dimension based on screen
+                updateDisplayMaxDimension(for: geometry)
+            }
+            .onChange(of: geometry.size) { _, newSize in
+                updateDisplayMaxDimension(for: geometry)
+            }
         }
-        .onChange(of: photoStore.selectedIndex) { _, newIndex in
+        .onChange(of: photoStore.selectedIndex) { oldIndex, newIndex in
             loadCurrentPhoto()
-            preloadAdjacentImages(around: newIndex)
+            schedulePreloading(around: newIndex, previousIndex: oldIndex)
         }
         .onChange(of: photoStore.photos) { _, _ in
             loadCurrentPhoto()
@@ -46,9 +64,16 @@ struct PhotoDisplayView: View {
         .onAppear {
             loadCurrentPhoto()
             if photoStore.selectedIndex >= 0 {
-                preloadAdjacentImages(around: photoStore.selectedIndex)
+                schedulePreloading(around: photoStore.selectedIndex, previousIndex: nil)
             }
         }
+    }
+    
+    private func updateDisplayMaxDimension(for geometry: GeometryProxy) {
+        // Use 2x for retina, capped at 4K
+        let screenScale = NSScreen.main?.backingScaleFactor ?? 2.0
+        let maxDim = max(geometry.size.width, geometry.size.height) * screenScale
+        displayMaxDimension = min(max(maxDim, 2560), 3840)
     }
     
     private var loadingView: some View {
@@ -141,9 +166,10 @@ struct PhotoDisplayView: View {
         
         let path = photo.path
         let cache = imageCache
+        let maxDim = displayMaxDimension
         
-        // Check cache first
-        Task {
+        // Check cache first - if hit, display instantly with NO loading indicator
+        Task { @MainActor in
             if let cached = await cache.fullSizeImage(for: path) {
                 image = cached
                 errorMessage = nil
@@ -151,7 +177,8 @@ struct PhotoDisplayView: View {
                 return
             }
             
-            startLoading(path: path)
+            // Not cached, need to load
+            startLoading(path: path, maxDimension: maxDim)
         }
     }
     
@@ -161,23 +188,23 @@ struct PhotoDisplayView: View {
         lastOffset = .zero
     }
     
-    private func startLoading(path: String) {
+    private func startLoading(path: String, maxDimension: CGFloat) {
         errorMessage = nil
         resetZoom()
         
         let cache = imageCache
         
-        // Debounce loading indicator - only show after 150ms
-        loadingDebounceTask = Task {
-            try? await Task.sleep(nanoseconds: 150_000_000) // 150ms
+        // Debounce loading indicator - only show after 100ms (reduced from 150ms)
+        loadingDebounceTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
             if !Task.isCancelled {
                 showLoading = true
             }
         }
         
-        // Load image using the unified cache manager
-        loadingTask = Task {
-            let result = await cache.loadFullSizeImage(at: path)
+        // Load image using optimized display-sized loading
+        loadingTask = Task { @MainActor in
+            let result = await cache.loadDisplayImage(at: path, maxDimension: maxDimension)
             
             guard !Task.isCancelled else { return }
             
@@ -195,43 +222,76 @@ struct PhotoDisplayView: View {
         }
     }
     
-    private func preloadAdjacentImages(around index: Int) {
-        // Capture the photos array and cache reference
+    /// Schedule aggressive preloading with priority
+    private func schedulePreloading(around index: Int, previousIndex: Int?) {
+        preloadTask?.cancel()
+        
         let photos = photoStore.photos
         let count = photos.count
-        let preloadRange = 5
         let cache = imageCache
+        let maxDim = displayMaxDimension
         
-        Task.detached(priority: .utility) {
-            // Preload next images
-            for preloadOffset in 1...preloadRange {
-                let nextIndex = index + preloadOffset
-                if nextIndex < count {
-                    let path = photos[nextIndex].path
-                    let cached = await cache.fullSizeImage(for: path)
-                    if cached == nil {
-                        let result = await loadImageFromDisk(at: path)
-                        if let img = result.image {
-                            await cache.setFullSizeImage(img, for: path)
-                        }
+        guard count > 0 else { return }
+        
+        // Determine scroll direction
+        let scrollingForward = previousIndex == nil || index > previousIndex!
+        
+        preloadTask = Task.detached(priority: .userInitiated) {
+            var requests: [PreloadRequest] = []
+            
+            // Priority 1: Immediately adjacent (critical for arrow key navigation)
+            if scrollingForward {
+                // Forward: prioritize next
+                if index + 1 < count {
+                    requests.append(PreloadRequest(path: photos[index + 1].path, priority: .high, maxDimension: maxDim))
+                }
+                if index - 1 >= 0 {
+                    requests.append(PreloadRequest(path: photos[index - 1].path, priority: .high, maxDimension: maxDim))
+                }
+            } else {
+                // Backward: prioritize previous
+                if index - 1 >= 0 {
+                    requests.append(PreloadRequest(path: photos[index - 1].path, priority: .high, maxDimension: maxDim))
+                }
+                if index + 1 < count {
+                    requests.append(PreloadRequest(path: photos[index + 1].path, priority: .high, maxDimension: maxDim))
+                }
+            }
+            
+            // Priority 2: Nearby (2-5)
+            for offset in 2...5 {
+                if scrollingForward {
+                    if index + offset < count {
+                        requests.append(PreloadRequest(path: photos[index + offset].path, priority: .medium, maxDimension: maxDim))
+                    }
+                    if index - offset >= 0 {
+                        requests.append(PreloadRequest(path: photos[index - offset].path, priority: .medium, maxDimension: maxDim))
+                    }
+                } else {
+                    if index - offset >= 0 {
+                        requests.append(PreloadRequest(path: photos[index - offset].path, priority: .medium, maxDimension: maxDim))
+                    }
+                    if index + offset < count {
+                        requests.append(PreloadRequest(path: photos[index + offset].path, priority: .medium, maxDimension: maxDim))
                     }
                 }
             }
             
-            // Preload previous images
-            for preloadOffset in 1...preloadRange {
-                let prevIndex = index - preloadOffset
-                if prevIndex >= 0 {
-                    let path = photos[prevIndex].path
-                    let cached = await cache.fullSizeImage(for: path)
-                    if cached == nil {
-                        let result = await loadImageFromDisk(at: path)
-                        if let img = result.image {
-                            await cache.setFullSizeImage(img, for: path)
-                        }
+            // Priority 3: Far ahead/behind (6-15)
+            for offset in 6...15 {
+                if scrollingForward {
+                    if index + offset < count {
+                        requests.append(PreloadRequest(path: photos[index + offset].path, priority: .low, maxDimension: maxDim))
+                    }
+                } else {
+                    if index - offset >= 0 {
+                        requests.append(PreloadRequest(path: photos[index - offset].path, priority: .low, maxDimension: maxDim))
                     }
                 }
             }
+            
+            // Execute preloading
+            await cache.preloadImages(requests: requests)
         }
     }
 }

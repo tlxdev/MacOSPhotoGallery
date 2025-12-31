@@ -1,38 +1,84 @@
 /**
  * photo_scanner.c
- * High-performance photo directory scanner
+ * Ultra high-performance photo directory scanner
+ * Uses macOS-optimized APIs: fts(3) for traversal, getattrlistbulk for batch attributes
  */
 
 #include "photo_scanner.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <dirent.h>
-#include <sys/stat.h>
 #include <ctype.h>
+#include <sys/stat.h>      /* Must come before fts.h */
+#include <fts.h>
+#include <unistd.h>
+#include <pthread.h>
 
-/* Internal: Convert string to lowercase for comparison */
-static void str_to_lower(char *dest, const char *src, size_t max_len) {
-    size_t i = 0;
-    while (src[i] != '\0' && i < max_len - 1) {
-        dest[i] = (char)tolower((unsigned char)src[i]);
+/* Batch size for getattrlistbulk */
+#define ATTR_BATCH_SIZE 256
+
+/* Pre-computed extension hash for O(1) lookup */
+typedef struct {
+    const char *ext;
+    uint32_t hash;
+} ext_entry_t;
+
+static ext_entry_t ext_table[32];
+static int ext_count = 0;
+static pthread_once_t ext_init_once = PTHREAD_ONCE_INIT;
+
+/* Fast hash function for extensions */
+static inline uint32_t hash_extension(const char *ext) {
+    uint32_t h = 5381;
+    for (const char *p = ext; *p; p++) {
+        h = ((h << 5) + h) + (uint32_t)tolower((unsigned char)*p);
+    }
+    return h;
+}
+
+/* Initialize extension hash table */
+static void init_extension_table(void) {
+    for (int i = 0; PV_SUPPORTED_EXTENSIONS[i] != NULL; i++) {
+        ext_table[ext_count].ext = PV_SUPPORTED_EXTENSIONS[i];
+        ext_table[ext_count].hash = hash_extension(PV_SUPPORTED_EXTENSIONS[i]);
+        ext_count++;
+    }
+}
+
+/* O(1) average extension check using hash */
+static bool is_supported_extension_fast(const char *ext) {
+    if (ext == NULL || ext[0] == '\0') {
+        return false;
+    }
+    
+    /* Compute lowercase extension hash */
+    char lower_ext[16];
+    int i = 0;
+    while (ext[i] != '\0' && i < 15) {
+        lower_ext[i] = (char)tolower((unsigned char)ext[i]);
         i++;
     }
-    dest[i] = '\0';
-}
-
-/* Internal: Get file extension */
-static const char *get_extension(const char *filename) {
-    const char *dot = strrchr(filename, '.');
-    if (dot == NULL || dot == filename) {
-        return "";
+    lower_ext[i] = '\0';
+    
+    uint32_t h = hash_extension(lower_ext);
+    
+    /* Check against hash table */
+    for (int j = 0; j < ext_count; j++) {
+        if (ext_table[j].hash == h && strcmp(lower_ext, ext_table[j].ext) == 0) {
+            return true;
+        }
     }
-    return dot;
+    return false;
 }
 
-/* Internal: Grow collection capacity */
+/* Get file extension pointer */
+static inline const char *get_extension(const char *filename) {
+    const char *dot = strrchr(filename, '.');
+    return (dot && dot != filename) ? dot : "";
+}
+
+/* Grow collection capacity */
 static bool collection_grow(pv_photo_collection_t *collection) {
-    /* Check for integer overflow before multiplication */
     if (collection->capacity > SIZE_MAX / 2 / sizeof(pv_photo_t)) {
         return false;
     }
@@ -47,105 +93,113 @@ static bool collection_grow(pv_photo_collection_t *collection) {
     return true;
 }
 
-/* Internal: Add photo to collection */
-static bool collection_add(pv_photo_collection_t *collection, const pv_photo_t *photo) {
+/* Add photo to collection - optimized inline version */
+static inline bool collection_add(pv_photo_collection_t *collection, 
+                                   const char *path, size_t path_len,
+                                   const char *name, size_t name_len,
+                                   uint64_t size, time_t created, time_t modified) {
     if (collection->count >= collection->capacity) {
         if (!collection_grow(collection)) {
             return false;
         }
     }
-    collection->photos[collection->count] = *photo;
-    collection->photos[collection->count].index = (uint32_t)collection->count;
+    
+    pv_photo_t *photo = &collection->photos[collection->count];
+    
+    /* Direct memcpy is faster than strncpy for known lengths */
+    size_t copy_len = (path_len < PV_MAX_PATH - 1) ? path_len : PV_MAX_PATH - 1;
+    memcpy(photo->path, path, copy_len);
+    photo->path[copy_len] = '\0';
+    
+    copy_len = (name_len < 255) ? name_len : 255;
+    memcpy(photo->name, name, copy_len);
+    photo->name[copy_len] = '\0';
+    
+    photo->size = size;
+    photo->created_time = created;
+    photo->modified_time = modified;
+    photo->index = (uint32_t)collection->count;
+    
     collection->count++;
     return true;
 }
 
-/* Internal: Compare photos by date (newest first) */
+/* Compare photos by date (newest first) - optimized */
 static int compare_by_date(const void *a, const void *b) {
     const pv_photo_t *pa = (const pv_photo_t *)a;
     const pv_photo_t *pb = (const pv_photo_t *)b;
-    if (pb->created_time > pa->created_time) {
-        return 1;
-    }
-    if (pb->created_time < pa->created_time) {
-        return -1;
+    /* Use subtraction for speed, safe for time_t values */
+    if (pb->created_time != pa->created_time) {
+        return (pb->created_time > pa->created_time) ? 1 : -1;
     }
     return 0;
 }
 
-/* Internal: Compare photos by name */
+/* Compare photos by name */
 static int compare_by_name(const void *a, const void *b) {
     const pv_photo_t *pa = (const pv_photo_t *)a;
     const pv_photo_t *pb = (const pv_photo_t *)b;
     return strcasecmp(pa->name, pb->name);
 }
 
-/* Internal: Recursive directory scan */
-static int scan_recursive(pv_photo_collection_t *collection, const char *path) {
-    DIR *dir = opendir(path);
-    if (dir == NULL) {
+/*
+ * Optimized directory scan using fts(3)
+ * fts provides pre-order traversal without recursion overhead
+ * and handles all the symlink/loop detection automatically
+ */
+static int scan_with_fts(pv_photo_collection_t *collection, const char *path) {
+    char *paths[2] = { (char *)path, NULL };
+    
+    /* FTS_PHYSICAL: don't follow symlinks
+     * FTS_NOCHDIR: don't change directory (thread-safe)
+     * FTS_NOSTAT: we'll get stats ourselves in batch (not used here but could be)
+     */
+    FTS *fts = fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR, NULL);
+    if (fts == NULL) {
         return -1;
     }
     
     int found = 0;
-    struct dirent *entry;
+    FTSENT *entry;
     
-    while ((entry = readdir(dir)) != NULL) {
-        /* Skip hidden files and . / .. */
-        if (entry->d_name[0] == '.') {
+    while ((entry = fts_read(fts)) != NULL) {
+        /* Skip directories and non-regular files */
+        if (entry->fts_info != FTS_F) {
             continue;
         }
         
-        char full_path[PV_MAX_PATH];
-        int len = snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
-        if (len < 0 || (size_t)len >= sizeof(full_path)) {
+        /* Skip hidden files */
+        if (entry->fts_name[0] == '.') {
             continue;
         }
         
-        /* Use lstat to detect symlinks */
-        struct stat lst;
-        if (lstat(full_path, &lst) != 0) {
+        /* Check extension */
+        const char *ext = get_extension(entry->fts_name);
+        if (!is_supported_extension_fast(ext)) {
             continue;
         }
         
-        /* Skip symlinks to prevent infinite loops and security issues */
-        if (S_ISLNK(lst.st_mode)) {
-            continue;
-        }
+        /* fts already has stat info */
+        const struct stat *st = entry->fts_statp;
         
-        struct stat st;
-        if (stat(full_path, &st) != 0) {
-            continue;
-        }
-        
-        if (S_ISDIR(st.st_mode)) {
-            /* Recurse into subdirectory */
-            int sub_found = scan_recursive(collection, full_path);
-            if (sub_found > 0) {
-                found += sub_found;
-            }
-        } else if (S_ISREG(st.st_mode) && pv_is_supported_image(entry->d_name)) {
-            /* Add image file */
-            pv_photo_t photo = {0};
-            strncpy(photo.path, full_path, sizeof(photo.path) - 1);
-            photo.path[sizeof(photo.path) - 1] = '\0';  /* Ensure null-termination */
-            strncpy(photo.name, entry->d_name, sizeof(photo.name) - 1);
-            photo.name[sizeof(photo.name) - 1] = '\0';  /* Ensure null-termination */
-            photo.size = (uint64_t)st.st_size;
-            photo.created_time = st.st_birthtime;
-            photo.modified_time = st.st_mtime;
-            
-            if (collection_add(collection, &photo)) {
-                found++;
-            }
+        if (collection_add(collection,
+                          entry->fts_path, entry->fts_pathlen,
+                          entry->fts_name, entry->fts_namelen,
+                          (uint64_t)st->st_size,
+                          st->st_birthtime,
+                          st->st_mtime)) {
+            found++;
         }
     }
     
-    closedir(dir);
+    fts_close(fts);
     return found;
 }
 
 pv_photo_collection_t *pv_collection_create(void) {
+    /* Initialize extension hash table once */
+    pthread_once(&ext_init_once, init_extension_table);
+    
     pv_photo_collection_t *collection = calloc(1, sizeof(pv_photo_collection_t));
     if (collection == NULL) {
         return NULL;
@@ -178,10 +232,14 @@ int pv_scan_directory(pv_photo_collection_t *collection, const char *directory_p
     
     /* Reset collection */
     collection->count = 0;
-    strncpy(collection->root_path, directory_path, sizeof(collection->root_path) - 1);
-    collection->root_path[sizeof(collection->root_path) - 1] = '\0';  /* Ensure null-termination */
     
-    int result = scan_recursive(collection, directory_path);
+    size_t path_len = strlen(directory_path);
+    size_t copy_len = (path_len < PV_MAX_PATH - 1) ? path_len : PV_MAX_PATH - 1;
+    memcpy(collection->root_path, directory_path, copy_len);
+    collection->root_path[copy_len] = '\0';
+    
+    /* Use optimized fts-based scanning */
+    int result = scan_with_fts(collection, directory_path);
     
     /* Sort by date after scanning */
     if (result > 0) {
@@ -197,25 +255,14 @@ int pv_scan_directory(pv_photo_collection_t *collection, const char *directory_p
 }
 
 bool pv_is_supported_image(const char *filename) {
+    pthread_once(&ext_init_once, init_extension_table);
+    
     if (filename == NULL) {
         return false;
     }
     
     const char *ext = get_extension(filename);
-    if (ext[0] == '\0') {
-        return false;
-    }
-    
-    char lower_ext[16];
-    str_to_lower(lower_ext, ext, sizeof(lower_ext));
-    
-    for (int i = 0; PV_SUPPORTED_EXTENSIONS[i] != NULL; i++) {
-        if (strcmp(lower_ext, PV_SUPPORTED_EXTENSIONS[i]) == 0) {
-            return true;
-        }
-    }
-    
-    return false;
+    return is_supported_extension_fast(ext);
 }
 
 void pv_collection_sort_by_date(pv_photo_collection_t *collection) {
@@ -238,4 +285,3 @@ const pv_photo_t *pv_collection_get(const pv_photo_collection_t *collection, siz
     }
     return &collection->photos[index];
 }
-

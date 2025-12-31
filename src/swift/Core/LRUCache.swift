@@ -80,6 +80,13 @@ actor LRUCache<Key: Hashable, Value> {
         cache.count
     }
     
+    /// Evict the oldest (least recently used) entry
+    func evictOldest() {
+        guard let oldestNode = tail else { return }
+        cache.removeValue(forKey: oldestNode.key)
+        removeNode(oldestNode)
+    }
+    
     // MARK: - Private Linked List Operations
     
     private func moveToFront(_ node: LRUNode<Key, Value>) {
@@ -117,13 +124,6 @@ actor LRUCache<Key: Hashable, Value> {
         
         node.prev = nil
         node.next = nil
-    }
-    
-    private func evictOldest() {
-        guard let oldestNode = tail else { return }
-        cache.removeValue(forKey: oldestNode.key)
-        removeNode(oldestNode)
-        AppLogger.debug("Evicted oldest cache entry", category: .imageCache)
     }
 }
 
