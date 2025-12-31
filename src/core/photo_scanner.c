@@ -95,6 +95,38 @@ static pv_ext_entry_t g_ext_table[32];
 static int g_ext_count = 0;
 static pthread_once_t g_ext_init_once = PTHREAD_ONCE_INIT;
 
+/* Bloom filter for O(1) extension rejection - 64-bit for cache efficiency */
+static uint64_t g_ext_bloom_filter = 0;
+
+/* Bloom filter hash functions */
+static inline uint64_t bloom_hash1(uint16_t h) {
+    return 1ULL << (h & 63);
+}
+static inline uint64_t bloom_hash2(uint16_t h) {
+    return 1ULL << ((h >> 6) & 63);
+}
+
+/* SIMD-accelerated lowercase conversion for 8 bytes */
+#if defined(PV_HAS_NEON)
+static inline void tolower_simd_8(const char *src, char *dst) {
+    const uint8x8_t chars = vld1_u8((const uint8_t *)src);
+    const uint8x8_t upper_A = vdup_n_u8('A');
+    const uint8x8_t upper_Z = vdup_n_u8('Z');
+    const uint8x8_t diff = vdup_n_u8('a' - 'A');
+    
+    /* Check if in range A-Z */
+    const uint8x8_t ge_A = vcge_u8(chars, upper_A);
+    const uint8x8_t le_Z = vcle_u8(chars, upper_Z);
+    const uint8x8_t is_upper = vand_u8(ge_A, le_Z);
+    
+    /* Add 32 to uppercase letters */
+    const uint8x8_t to_add = vand_u8(is_upper, diff);
+    const uint8x8_t result = vadd_u8(chars, to_add);
+    
+    vst1_u8((uint8_t *)dst, result);
+}
+#endif
+
 /* Fast 16-bit hash for extension pre-filtering */
 static inline uint16_t hash_extension_fast(const char *ext, size_t len) {
     uint16_t h = 0x1505;
@@ -104,8 +136,10 @@ static inline uint16_t hash_extension_fast(const char *ext, size_t len) {
     return h;
 }
 
-/* Initialize extension table with pre-computed data */
+/* Initialize extension table with pre-computed data and bloom filter */
 static void init_extension_table(void) {
+    g_ext_bloom_filter = 0;
+    
     for (int i = 0; PV_SUPPORTED_EXTENSIONS[i] != NULL && g_ext_count < 32; i++) {
         const char *ext = PV_SUPPORTED_EXTENSIONS[i];
         size_t len = strlen(ext);
@@ -120,25 +154,37 @@ static void init_extension_table(void) {
         }
         
         entry->hash = hash_extension_fast(ext, len);
+        
+        /* Add to bloom filter for O(1) rejection */
+        g_ext_bloom_filter |= bloom_hash1(entry->hash);
+        g_ext_bloom_filter |= bloom_hash2(entry->hash);
+        
         g_ext_count++;
     }
 }
 
 #if defined(PV_HAS_NEON)
-/* ARM NEON SIMD extension matching */
+/* ARM NEON SIMD extension matching with bloom filter pre-check */
 static inline bool match_extension_simd_neon(const char *ext, size_t len) {
     if (len > 7 || len == 0) {
         return false;
     }
     
-    /* Load and lowercase the input extension */
-    char lower_ext[8] = {0};
-    for (size_t i = 0; i < len; i++) {
-        lower_ext[i] = (char)tolower((unsigned char)ext[i]);
-    }
+    /* SIMD lowercase - pad input to 8 bytes */
+    char padded_ext[8] = {0};
+    memcpy(padded_ext, ext, len);
+    
+    char lower_ext[8];
+    tolower_simd_8(padded_ext, lower_ext);
     
     /* Pre-filter with hash */
-    const uint16_t input_hash = hash_extension_fast(ext, len);
+    const uint16_t input_hash = hash_extension_fast(lower_ext, len);
+    
+    /* Bloom filter check - O(1) rejection for non-matching extensions */
+    const uint64_t bloom_check = bloom_hash1(input_hash) | bloom_hash2(input_hash);
+    if ((g_ext_bloom_filter & bloom_check) != bloom_check) {
+        return false;  /* Definitely not a match */
+    }
     
     /* Load input as NEON vector */
     const uint8x8_t input_vec = vld1_u8((const uint8_t *)lower_ext);
@@ -708,35 +754,83 @@ static int scan_with_fts_parallel(pv_photo_collection_t *collection, const char 
 
 /* ============================================================================
  * Radix Sort for O(n) Date Sorting
+ * OPTIMIZATION: Sort indices (4 bytes) instead of full structs (4KB+)
+ * This reduces memory bandwidth by ~1000x
  * ============================================================================ */
 
-/* Radix sort by creation time (8-byte timestamps) */
+/* Radix sort by creation time - sorts INDICES not structs for speed */
 static void radix_sort_by_date(pv_photo_t *photos, size_t count) {
     if (count < 2) {
         return;
     }
     
-    /* Allocate temporary buffer */
-    pv_photo_t *temp = aligned_alloc(PV_CACHE_LINE_SIZE, count * sizeof(pv_photo_t));
-    if (temp == NULL) {
-        /* Fallback to qsort */
+    /* For very small arrays, use simple insertion sort */
+    if (count < 32) {
+        for (size_t i = 1; i < count; i++) {
+            pv_photo_t key = photos[i];
+            size_t j = i;
+            while (j > 0 && photos[j - 1].created_time < key.created_time) {
+                photos[j] = photos[j - 1];
+                j--;
+            }
+            photos[j] = key;
+        }
         return;
     }
     
+    /* Allocate index arrays - MUCH smaller than full struct arrays */
+    uint32_t *indices = malloc(count * sizeof(uint32_t));
+    uint32_t *temp_indices = malloc(count * sizeof(uint32_t));
+    
+    if (indices == NULL || temp_indices == NULL) {
+        free(indices);
+        free(temp_indices);
+        return;
+    }
+    
+    /* Initialize indices */
+    for (size_t i = 0; i < count; i++) {
+        indices[i] = (uint32_t)i;
+    }
+    
+    /* Extract timestamps for cache efficiency */
+    uint64_t *timestamps = malloc(count * sizeof(uint64_t));
+    if (timestamps == NULL) {
+        free(indices);
+        free(temp_indices);
+        return;
+    }
+    
+    /* Pre-compute inverted timestamps (newest first) */
+    for (size_t i = 0; i < count; i++) {
+        timestamps[i] = ~(uint64_t)photos[i].created_time;
+    }
+    
+    /* Determine which bytes actually vary (skip constant upper bytes) */
+    uint64_t all_or = 0, all_and = ~0ULL;
+    for (size_t i = 0; i < count; i++) {
+        all_or |= timestamps[i];
+        all_and &= timestamps[i];
+    }
+    const uint64_t varying_bits = all_or ^ all_and;
+    
     /* Count arrays for each byte (256 buckets) */
     size_t counts[256];
-    pv_photo_t *src = photos;
-    pv_photo_t *dst = temp;
+    uint32_t *src = indices;
+    uint32_t *dst = temp_indices;
     
-    /* Sort by each byte of the timestamp (LSB first) */
+    /* Sort by each byte of the timestamp (LSB first), skip constant bytes */
     for (int byte = 0; byte < 8; byte++) {
+        /* Skip bytes that don't vary - common when photos are from same period */
+        if (((varying_bits >> (byte * 8)) & 0xFF) == 0) {
+            continue;
+        }
+        
         memset(counts, 0, sizeof(counts));
         
         /* Count occurrences */
         for (size_t i = 0; i < count; i++) {
-            /* Extract byte from timestamp (inverted for newest-first) */
-            const uint64_t inverted_time = ~(uint64_t)src[i].created_time;
-            const uint8_t bucket = (inverted_time >> (byte * 8)) & 0xFF;
+            const uint8_t bucket = (timestamps[src[i]] >> (byte * 8)) & 0xFF;
             counts[bucket]++;
         }
         
@@ -750,23 +844,30 @@ static void radix_sort_by_date(pv_photo_t *photos, size_t count) {
         
         /* Distribute to output */
         for (size_t i = 0; i < count; i++) {
-            const uint64_t inverted_time = ~(uint64_t)src[i].created_time;
-            const uint8_t bucket = (inverted_time >> (byte * 8)) & 0xFF;
+            const uint8_t bucket = (timestamps[src[i]] >> (byte * 8)) & 0xFF;
             dst[counts[bucket]++] = src[i];
         }
         
         /* Swap buffers */
-        pv_photo_t *swap = src;
+        uint32_t *swap = src;
         src = dst;
         dst = swap;
     }
     
-    /* If result is in temp, copy back */
-    if (src != photos) {
-        memcpy(photos, src, count * sizeof(pv_photo_t));
+    /* Reorder photos array according to sorted indices */
+    /* Use temp buffer to avoid in-place permutation complexity */
+    pv_photo_t *temp_photos = aligned_alloc(PV_CACHE_LINE_SIZE, count * sizeof(pv_photo_t));
+    if (temp_photos != NULL) {
+        for (size_t i = 0; i < count; i++) {
+            temp_photos[i] = photos[src[i]];
+        }
+        memcpy(photos, temp_photos, count * sizeof(pv_photo_t));
+        free(temp_photos);
     }
     
-    free(temp);
+    free(timestamps);
+    free(indices);
+    free(temp_indices);
 }
 
 /* Comparison function for name sorting */
