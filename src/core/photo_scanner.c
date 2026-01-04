@@ -1,15 +1,11 @@
 /**
  * photo_scanner.c
- * Ultra high-performance photo directory scanner
- * 
- * Optimizations implemented:
- * 1. Parallel directory scanning with GCD (Grand Central Dispatch)
- * 2. SIMD-accelerated extension matching (ARM NEON / x86 SSE4.2)
- * 3. getattrlistbulk for batch attribute fetching
- * 4. Cache-aligned data structures
- * 5. Lock-free concurrent writes with atomic operations
- * 6. Radix sort for O(n) date sorting
- * 7. Prefetch hints for cache optimization
+ * High-performance photo directory scanner
+ *
+ * Key optimizations:
+ * - Parallel directory scanning with GCD
+ * - getattrlistbulk for batch attribute fetching
+ * - Radix sort for O(n) date sorting
  */
 
 #include "photo_scanner.h"
@@ -46,13 +42,10 @@
 #define PV_LOG_DEBUG(fmt, ...) \
     do { if (PV_DEBUG) fprintf(stderr, "[PhotoScanner DEBUG] %s:%d: " fmt "\n", __func__, __LINE__, ##__VA_ARGS__); } while(0)
 
-/* SIMD headers */
+/* Architecture detection for capability reporting */
 #if defined(__aarch64__) || defined(__arm64__)
-    #include <arm_neon.h>
     #define PV_HAS_NEON 1
 #elif defined(__x86_64__) || defined(__i386__)
-    #include <immintrin.h>
-    #include <nmmintrin.h>
     #define PV_HAS_SSE42 1
 #endif
 
@@ -81,218 +74,30 @@
 #define PV_MAX_RECURSION_DEPTH 100
 
 /* ============================================================================
- * Extension Matching - SIMD Optimized
+ * Extension Matching
  * ============================================================================ */
 
-/* Pre-computed extension data for SIMD matching */
-typedef struct {
-    char ext_lower[8];     /* Lowercase extension, padded */
-    uint8_t len;           /* Extension length */
-    uint16_t hash;         /* Fast hash for pre-filtering */
-} pv_ext_entry_t;
+/* Simple extension matching - strcasecmp is highly optimized in libc */
+static inline bool is_supported_extension(const char *ext) {
+    if (ext == NULL || *ext == '\0') {
+        return false;
+    }
 
-static pv_ext_entry_t g_ext_table[32];
-static int g_ext_count = 0;
-static pthread_once_t g_ext_init_once = PTHREAD_ONCE_INIT;
-
-/* Bloom filter for O(1) extension rejection - 64-bit for cache efficiency */
-static uint64_t g_ext_bloom_filter = 0;
-
-/* Bloom filter hash functions */
-static inline uint64_t bloom_hash1(uint16_t h) {
-    return 1ULL << (h & 63);
-}
-static inline uint64_t bloom_hash2(uint16_t h) {
-    return 1ULL << ((h >> 6) & 63);
+    for (int i = 0; PV_SUPPORTED_EXTENSIONS[i] != NULL; i++) {
+        if (strcasecmp(ext, PV_SUPPORTED_EXTENSIONS[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
-/* Fast 16-bit hash for extension pre-filtering */
-static inline uint16_t hash_extension_fast(const char *ext, size_t len) {
+/* Simple hash for extension (used for ext_hash field in pv_photo_t) */
+static inline uint16_t hash_extension(const char *ext) {
     uint16_t h = 0x1505;
-    for (size_t i = 0; i < len; i++) {
-        h = ((h << 5) + h) ^ (uint16_t)tolower((unsigned char)ext[i]);
+    while (*ext) {
+        h = ((h << 5) + h) ^ (uint16_t)tolower((unsigned char)*ext++);
     }
     return h;
-}
-
-/* Initialize extension table with pre-computed data and bloom filter */
-static void init_extension_table(void) {
-    g_ext_bloom_filter = 0;
-    
-    for (int i = 0; PV_SUPPORTED_EXTENSIONS[i] != NULL && g_ext_count < 32; i++) {
-        const char *ext = PV_SUPPORTED_EXTENSIONS[i];
-        size_t len = strlen(ext);
-        
-        pv_ext_entry_t *entry = &g_ext_table[g_ext_count];
-        entry->len = (uint8_t)len;
-        
-        /* Store lowercase, zero-padded for SIMD comparison */
-        memset(entry->ext_lower, 0, sizeof(entry->ext_lower));
-        for (size_t j = 0; j < len && j < 7; j++) {
-            entry->ext_lower[j] = (char)tolower((unsigned char)ext[j]);
-        }
-        
-        entry->hash = hash_extension_fast(ext, len);
-        
-        /* Add to bloom filter for O(1) rejection */
-        g_ext_bloom_filter |= bloom_hash1(entry->hash);
-        g_ext_bloom_filter |= bloom_hash2(entry->hash);
-        
-        g_ext_count++;
-    }
-}
-
-#if defined(PV_HAS_NEON)
-/* ARM NEON SIMD extension matching with bloom filter pre-check */
-static inline bool match_extension_simd_neon(const char *ext, size_t len) {
-    if (len > 7 || len == 0) {
-        return false;
-    }
-    
-    /* Load and lowercase the input extension */
-    char lower_ext[8] = {0};
-    for (size_t i = 0; i < len; i++) {
-        lower_ext[i] = (char)tolower((unsigned char)ext[i]);
-    }
-    
-    /* Pre-filter with hash */
-    const uint16_t input_hash = hash_extension_fast(ext, len);
-
-    /* Bloom filter check - O(1) rejection for non-matching extensions */
-    const uint64_t bloom_check = bloom_hash1(input_hash) | bloom_hash2(input_hash);
-    if ((g_ext_bloom_filter & bloom_check) != bloom_check) {
-        return false;  /* Definitely not a match */
-    }
-
-    /* Load input as NEON vector */
-    const uint8x8_t input_vec = vld1_u8((const uint8_t *)lower_ext);
-    
-    for (int i = 0; i < g_ext_count; i++) {
-        const pv_ext_entry_t *entry = &g_ext_table[i];
-        
-        /* Quick hash check first */
-        if (entry->hash != input_hash) {
-            continue;
-        }
-        
-        /* Length must match */
-        if (entry->len != len) {
-            continue;
-        }
-        
-        /* SIMD comparison */
-        const uint8x8_t table_vec = vld1_u8((const uint8_t *)entry->ext_lower);
-        const uint8x8_t cmp = vceq_u8(input_vec, table_vec);
-        
-        /* Check if all bytes match (for the relevant length) */
-        const uint64_t result = vget_lane_u64(vreinterpret_u64_u8(cmp), 0);
-        const uint64_t mask = (1ULL << (len * 8)) - 1;
-        
-        if ((result & mask) == mask) {
-            return true;
-        }
-    }
-    
-    return false;
-}
-#endif
-
-#if defined(PV_HAS_SSE42)
-/* x86 SSE4.2 SIMD extension matching */
-static inline bool match_extension_simd_sse(const char *ext, size_t len) {
-    if (len > 7 || len == 0) {
-        return false;
-    }
-    
-    /* Load and lowercase the input extension */
-    char lower_ext[16] __attribute__((aligned(16))) = {0};
-    for (size_t i = 0; i < len; i++) {
-        lower_ext[i] = (char)tolower((unsigned char)ext[i]);
-    }
-    
-    /* Pre-filter with hash */
-    const uint16_t input_hash = hash_extension_fast(ext, len);
-    
-    /* Load input as SSE vector */
-    const __m128i input_vec = _mm_loadu_si128((const __m128i *)lower_ext);
-    
-    for (int i = 0; i < g_ext_count; i++) {
-        const pv_ext_entry_t *entry = &g_ext_table[i];
-        
-        /* Quick hash check first */
-        if (entry->hash != input_hash) {
-            continue;
-        }
-        
-        /* Length must match */
-        if (entry->len != len) {
-            continue;
-        }
-        
-        /* Load table entry (padded to 16 bytes) */
-        char table_padded[16] __attribute__((aligned(16))) = {0};
-        memcpy(table_padded, entry->ext_lower, 8);
-        const __m128i table_vec = _mm_load_si128((const __m128i *)table_padded);
-        
-        /* Compare using SSE4.2 string comparison */
-        const int result = _mm_cmpestri(
-            input_vec, (int)len,
-            table_vec, (int)len,
-            _SIDD_UBYTE_OPS | _SIDD_CMP_EQUAL_EACH | _SIDD_NEGATIVE_POLARITY
-        );
-        
-        if (result >= (int)len) {
-            return true;
-        }
-    }
-    
-    return false;
-}
-#endif
-
-/* Scalar fallback for extension matching */
-__attribute__((unused))
-static bool match_extension_scalar(const char *ext, size_t len) {
-    if (len > 7 || len == 0) {
-        return false;
-    }
-    
-    char lower_ext[8];
-    for (size_t i = 0; i < len; i++) {
-        lower_ext[i] = (char)tolower((unsigned char)ext[i]);
-    }
-    lower_ext[len] = '\0';
-    
-    const uint16_t input_hash = hash_extension_fast(ext, len);
-    
-    for (int i = 0; i < g_ext_count; i++) {
-        const pv_ext_entry_t *entry = &g_ext_table[i];
-        
-        if (entry->hash == input_hash && entry->len == len) {
-            if (memcmp(lower_ext, entry->ext_lower, len) == 0) {
-                return true;
-            }
-        }
-    }
-    
-    return false;
-}
-
-/* Unified extension check - dispatches to SIMD or scalar */
-static inline bool is_supported_extension(const char *ext) {
-    if (ext == NULL || ext[0] == '\0') {
-        return false;
-    }
-    
-    const size_t len = strlen(ext);
-    
-#if defined(PV_HAS_NEON)
-    return match_extension_simd_neon(ext, len);
-#elif defined(PV_HAS_SSE42)
-    return match_extension_simd_sse(ext, len);
-#else
-    return match_extension_scalar(ext, len);
-#endif
 }
 
 /* Get extension pointer from filename */
@@ -431,7 +236,7 @@ static inline bool collection_add_locked(
     
     /* Compute extension hash for fast filtering */
     const char *ext = get_extension(photo->path + photo->name_offset);
-    photo->ext_hash = hash_extension_fast(ext, strlen(ext));
+    photo->ext_hash = hash_extension(ext);
     
     /* Release lock after all writes complete */
     pthread_mutex_unlock(lock);
@@ -876,10 +681,7 @@ static inline uint64_t get_time_ns(void) {
 
 pv_photo_collection_t *pv_collection_create(void) {
     PV_LOG_DEBUG("Creating photo collection");
-    
-    /* Initialize extension table once */
-    pthread_once(&g_ext_init_once, init_extension_table);
-    
+
     pv_photo_collection_t *collection = calloc(1, sizeof(pv_photo_collection_t));
     if (collection == NULL) {
         PV_LOG_ERROR("Failed to allocate collection struct");
@@ -1093,12 +895,9 @@ int pv_scan_directory_ex(
 }
 
 bool pv_is_supported_image(const char *filename) {
-    pthread_once(&g_ext_init_once, init_extension_table);
-    
     if (filename == NULL) {
         return false;
     }
-    
     const char *ext = get_extension(filename);
     return is_supported_extension(ext);
 }
