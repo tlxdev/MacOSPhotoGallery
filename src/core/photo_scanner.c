@@ -106,27 +106,6 @@ static inline uint64_t bloom_hash2(uint16_t h) {
     return 1ULL << ((h >> 6) & 63);
 }
 
-/* SIMD-accelerated lowercase conversion for 8 bytes */
-#if defined(PV_HAS_NEON)
-static inline void tolower_simd_8(const char *src, char *dst) {
-    const uint8x8_t chars = vld1_u8((const uint8_t *)src);
-    const uint8x8_t upper_A = vdup_n_u8('A');
-    const uint8x8_t upper_Z = vdup_n_u8('Z');
-    const uint8x8_t diff = vdup_n_u8('a' - 'A');
-    
-    /* Check if in range A-Z */
-    const uint8x8_t ge_A = vcge_u8(chars, upper_A);
-    const uint8x8_t le_Z = vcle_u8(chars, upper_Z);
-    const uint8x8_t is_upper = vand_u8(ge_A, le_Z);
-    
-    /* Add 32 to uppercase letters */
-    const uint8x8_t to_add = vand_u8(is_upper, diff);
-    const uint8x8_t result = vadd_u8(chars, to_add);
-    
-    vst1_u8((uint8_t *)dst, result);
-}
-#endif
-
 /* Fast 16-bit hash for extension pre-filtering */
 static inline uint16_t hash_extension_fast(const char *ext, size_t len) {
     uint16_t h = 0x1505;
@@ -170,22 +149,21 @@ static inline bool match_extension_simd_neon(const char *ext, size_t len) {
         return false;
     }
     
-    /* SIMD lowercase - pad input to 8 bytes */
-    char padded_ext[8] = {0};
-    memcpy(padded_ext, ext, len);
-    
-    char lower_ext[8];
-    tolower_simd_8(padded_ext, lower_ext);
+    /* Load and lowercase the input extension */
+    char lower_ext[8] = {0};
+    for (size_t i = 0; i < len; i++) {
+        lower_ext[i] = (char)tolower((unsigned char)ext[i]);
+    }
     
     /* Pre-filter with hash */
-    const uint16_t input_hash = hash_extension_fast(lower_ext, len);
-    
+    const uint16_t input_hash = hash_extension_fast(ext, len);
+
     /* Bloom filter check - O(1) rejection for non-matching extensions */
     const uint64_t bloom_check = bloom_hash1(input_hash) | bloom_hash2(input_hash);
     if ((g_ext_bloom_filter & bloom_check) != bloom_check) {
         return false;  /* Definitely not a match */
     }
-    
+
     /* Load input as NEON vector */
     const uint8x8_t input_vec = vld1_u8((const uint8_t *)lower_ext);
     
