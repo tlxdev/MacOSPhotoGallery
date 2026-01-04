@@ -53,39 +53,45 @@ extern "C" {
  * ============================================================================ */
 
 /**
- * Photo file information - 64-byte aligned for cache efficiency
- * Hot data (frequently accessed) packed together
+ * Photo file information - exactly 64 bytes (one cache line)
+ * Paths stored separately in string pool for cache efficiency
  */
 typedef struct __attribute__((aligned(PV_CACHE_LINE_SIZE))) {
-    /* Hot data - first cache line (64 bytes) */
+    /* All hot data fits in single cache line */
     uint64_t size;              /* 8 bytes - file size */
     time_t created_time;        /* 8 bytes - creation timestamp */
     time_t modified_time;       /* 8 bytes - modification timestamp */
+    uint32_t path_offset;       /* 4 bytes - offset into path pool */
     uint32_t index;             /* 4 bytes - index in collection */
-    uint32_t name_offset;       /* 4 bytes - offset to name in path */
     uint16_t path_len;          /* 2 bytes - path length */
+    uint16_t name_offset;       /* 2 bytes - offset to name within path */
     uint16_t name_len;          /* 2 bytes - name length */
-    uint16_t ext_hash;          /* 2 bytes - extension hash for fast filtering */
-    uint16_t _pad;              /* 2 bytes - padding */
-    char path[PV_MAX_PATH];     /* Path stored separately */
+    uint16_t ext_hash;          /* 2 bytes - extension hash */
+    uint8_t _pad[24];           /* 24 bytes - pad to 64 bytes */
 } pv_photo_t;
 
 /**
  * Photo collection with thread-safe operations
- * Note: Internal atomics are handled via accessor functions for Swift compatibility
+ * Paths stored in separate pool for cache-efficient photo iteration
  */
 typedef struct {
-    pv_photo_t *photos;                    /* Dynamic array of photos */
-    size_t count;                          /* Current count (use pv_collection_count for thread-safe access) */
+    pv_photo_t *photos;                    /* Dynamic array of photos (64 bytes each) */
+    size_t count;                          /* Current count */
     size_t capacity;                       /* Current capacity */
+
+    /* Path string pool - contiguous storage for all paths */
+    char *path_pool;                       /* Contiguous path storage */
+    size_t path_pool_size;                 /* Current used size */
+    size_t path_pool_capacity;             /* Allocated capacity */
+
     char root_path[PV_MAX_PATH];           /* Root directory path */
-    
+
     /* Statistics */
     uint64_t scan_time_ns;                 /* Time taken to scan (nanoseconds) */
     uint64_t sort_time_ns;                 /* Time taken to sort (nanoseconds) */
     uint32_t directories_scanned;          /* Number of directories processed */
     uint32_t files_examined;               /* Total files examined */
-    
+
     /* Internal: for thread-safe concurrent additions during scan */
     void *_internal_lock;                  /* pthread_mutex_t* - opaque for Swift */
 } pv_photo_collection_t;
@@ -108,8 +114,8 @@ typedef struct {
     .thread_count = 0,                                 \
     .follow_symlinks = false,                          \
     .include_hidden = false,                           \
-    .use_simd = true,                                  \
-    .use_batch_attrs = false  /* Disabled - fts is more reliable */  \
+    .use_simd = false,                                 \
+    .use_batch_attrs = true                            \
 })
 
 /* ============================================================================
@@ -198,17 +204,19 @@ size_t pv_collection_count(const pv_photo_collection_t *collection);
 
 /**
  * Get photo path
+ * @param collection The collection containing the photo
  * @param photo The photo
  * @return Path string
  */
-const char *pv_photo_get_path(const pv_photo_t *photo);
+const char *pv_photo_get_path(const pv_photo_collection_t *collection, const pv_photo_t *photo);
 
 /**
  * Get photo name
+ * @param collection The collection containing the photo
  * @param photo The photo
  * @return Filename string
  */
-const char *pv_photo_get_name(const pv_photo_t *photo);
+const char *pv_photo_get_name(const pv_photo_collection_t *collection, const pv_photo_t *photo);
 
 /**
  * Get photo file size

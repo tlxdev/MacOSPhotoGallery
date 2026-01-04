@@ -173,8 +173,8 @@ final class PhotoStore {
             }
             
             // Use accessor functions for Swift compatibility
-            guard let pathPtr = pv_photo_get_path(photo),
-                  let namePtr = pv_photo_get_name(photo) else {
+            guard let pathPtr = pv_photo_get_path(collection, photo),
+                  let namePtr = pv_photo_get_name(collection, photo) else {
                 AppLogger.warning("Failed to get path/name for photo at index \(i)", category: .photoStore)
                 continue
             }

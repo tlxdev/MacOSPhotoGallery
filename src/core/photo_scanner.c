@@ -25,6 +25,7 @@
 #include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
 #include <sys/sysctl.h>
+#include <sys/mman.h>  /* madvise for memory access hints */
 
 /* ============================================================================
  * Debug Logging
@@ -58,10 +59,19 @@
     #define PV_PREFETCH(addr) __builtin_prefetch(addr, 0, 3)
     #define PV_LIKELY(x) __builtin_expect(!!(x), 1)
     #define PV_UNLIKELY(x) __builtin_expect(!!(x), 0)
+    /* Force inline critical hot-path functions */
+    #define PV_HOT __attribute__((hot, always_inline))
+    /* Mark error paths as cold - keeps them out of instruction cache */
+    #define PV_COLD __attribute__((cold, noinline))
+    /* Restrict pointer - tells compiler this is the only pointer to this memory */
+    #define PV_RESTRICT __restrict__
 #else
     #define PV_PREFETCH(addr) ((void)0)
     #define PV_LIKELY(x) (x)
     #define PV_UNLIKELY(x) (x)
+    #define PV_HOT
+    #define PV_COLD
+    #define PV_RESTRICT
 #endif
 
 /* Alignment macro */
@@ -78,8 +88,8 @@
  * ============================================================================ */
 
 /* Simple extension matching - strcasecmp is highly optimized in libc */
-static inline bool is_supported_extension(const char *ext) {
-    if (ext == NULL || *ext == '\0') {
+static PV_HOT inline bool is_supported_extension(const char * PV_RESTRICT ext) {
+    if (PV_UNLIKELY(ext == NULL || *ext == '\0')) {
         return false;
     }
 
@@ -136,7 +146,155 @@ static bool collection_grow(pv_photo_collection_t *collection) {
     return true;
 }
 
-/* Thread-safe addition using mutex
+/* ============================================================================
+ * Batch Addition for Reduced Lock Contention
+ * ============================================================================ */
+
+#define PV_BATCH_SIZE 64
+#define PV_PATH_POOL_INITIAL_SIZE (1024 * 1024)  /* 1MB initial path pool */
+
+/* Temporary photo data for batch operations */
+typedef struct {
+    char path[PV_MAX_PATH];
+    size_t path_len;
+    size_t name_offset;
+    size_t name_len;
+    uint64_t size;
+    time_t created;
+    time_t modified;
+} pv_photo_batch_entry_t;
+
+/* Batch buffer for collecting photos before adding to collection */
+typedef struct {
+    pv_photo_batch_entry_t entries[PV_BATCH_SIZE];
+    int count;
+} pv_photo_batch_t;
+
+/* Grow path pool if needed - called while holding lock
+ * Uses aligned allocation for better cache/TLB performance */
+static bool grow_path_pool(pv_photo_collection_t *collection, size_t needed) {
+    size_t required = collection->path_pool_size + needed;
+    if (required <= collection->path_pool_capacity) {
+        return true;
+    }
+
+    size_t new_capacity = collection->path_pool_capacity * 2;
+    while (new_capacity < required) {
+        new_capacity *= 2;
+    }
+
+    /* Allocate new page-aligned pool and copy */
+    char *new_pool = aligned_alloc(4096, new_capacity);
+    if (new_pool == NULL) {
+        return false;
+    }
+    memcpy(new_pool, collection->path_pool, collection->path_pool_size);
+    free(collection->path_pool);
+
+    collection->path_pool = new_pool;
+    collection->path_pool_capacity = new_capacity;
+    /* Tell kernel about sequential access pattern */
+    madvise(new_pool, new_capacity, MADV_SEQUENTIAL);
+    return true;
+}
+
+/* Add a batch of photos to collection under single lock */
+static int collection_add_batch(
+    pv_photo_collection_t *collection,
+    pv_photo_batch_t *batch
+) {
+    if (collection == NULL || batch == NULL || batch->count == 0) {
+        return 0;
+    }
+
+    pthread_mutex_t *lock = (pthread_mutex_t *)collection->_internal_lock;
+    if (lock == NULL) {
+        return 0;
+    }
+
+    pthread_mutex_lock(lock);
+
+    int added = 0;
+    for (int i = 0; i < batch->count; i++) {
+        /* Grow photos array if needed */
+        if (collection->count >= collection->capacity) {
+            if (collection->capacity > SIZE_MAX / 2 / sizeof(pv_photo_t)) {
+                break;
+            }
+            const size_t new_capacity = collection->capacity * 2;
+            pv_photo_t *new_photos = aligned_alloc(PV_CACHE_LINE_SIZE, new_capacity * sizeof(pv_photo_t));
+            if (new_photos == NULL) {
+                break;
+            }
+            memcpy(new_photos, collection->photos, collection->count * sizeof(pv_photo_t));
+            free(collection->photos);
+            collection->photos = new_photos;
+            collection->capacity = new_capacity;
+        }
+
+        pv_photo_batch_entry_t *entry = &batch->entries[i];
+
+        /* Grow path pool if needed */
+        if (!grow_path_pool(collection, entry->path_len + 1)) {
+            break;
+        }
+
+        pv_photo_t *photo = &collection->photos[collection->count++];
+
+        /* Store path in pool */
+        photo->path_offset = (uint32_t)collection->path_pool_size;
+        memcpy(collection->path_pool + collection->path_pool_size, entry->path, entry->path_len + 1);
+        collection->path_pool_size += entry->path_len + 1;
+
+        /* Set metadata */
+        photo->path_len = (uint16_t)entry->path_len;
+        photo->name_offset = (uint16_t)entry->name_offset;
+        photo->name_len = (uint16_t)entry->name_len;
+        photo->size = entry->size;
+        photo->created_time = entry->created;
+        photo->modified_time = entry->modified;
+        photo->index = (uint32_t)(collection->count - 1);
+
+        /* Compute extension hash */
+        const char *ext = get_extension(collection->path_pool + photo->path_offset + photo->name_offset);
+        photo->ext_hash = hash_extension(ext);
+
+        added++;
+    }
+
+    pthread_mutex_unlock(lock);
+    batch->count = 0;
+    return added;
+}
+
+/* Add entry to batch, flush if full */
+static inline bool batch_add(
+    pv_photo_batch_t *batch,
+    pv_photo_collection_t *collection,
+    const char *path,
+    size_t path_len,
+    size_t name_offset,
+    size_t name_len,
+    uint64_t size,
+    time_t created,
+    time_t modified
+) {
+    if (batch->count >= PV_BATCH_SIZE) {
+        collection_add_batch(collection, batch);
+    }
+
+    pv_photo_batch_entry_t *entry = &batch->entries[batch->count++];
+    memcpy(entry->path, path, path_len + 1);
+    entry->path_len = path_len;
+    entry->name_offset = name_offset;
+    entry->name_len = name_len;
+    entry->size = size;
+    entry->created = created;
+    entry->modified = modified;
+    return true;
+}
+
+/* Thread-safe addition using mutex (legacy, still used by FTS fallback)
  * SECURITY: All writes happen while holding the lock to prevent race conditions
  */
 static inline bool collection_add_locked(
@@ -213,34 +371,39 @@ static inline bool collection_add_locked(
     
     /* SECURITY: All writes happen while holding the lock to prevent
      * race condition where another thread resizes the array */
-    
-    /* Zero the struct first */
-    memset(photo, 0, sizeof(pv_photo_t));
-    
-    /* Copy path with bounds checking */
+
+    /* Grow path pool if needed */
     const size_t copy_len = (path_len < PV_MAX_PATH - 1) ? path_len : PV_MAX_PATH - 1;
-    memcpy(photo->path, path, copy_len);
-    photo->path[copy_len] = '\0';
-    
+    if (!grow_path_pool(collection, copy_len + 1)) {
+        pthread_mutex_unlock(lock);
+        return false;
+    }
+
+    /* Store path in pool */
+    photo->path_offset = (uint32_t)collection->path_pool_size;
+    memcpy(collection->path_pool + collection->path_pool_size, path, copy_len);
+    collection->path_pool[collection->path_pool_size + copy_len] = '\0';
+    collection->path_pool_size += copy_len + 1;
+
     /* Ensure name_offset is within the copied path */
     const size_t safe_name_offset = (name_offset <= copy_len) ? name_offset : copy_len;
-    
+
     /* Set metadata */
     photo->path_len = (uint16_t)copy_len;
-    photo->name_offset = (uint32_t)safe_name_offset;
+    photo->name_offset = (uint16_t)safe_name_offset;
     photo->name_len = (uint16_t)((name_len <= copy_len - safe_name_offset) ? name_len : copy_len - safe_name_offset);
     photo->size = size;
     photo->created_time = created;
     photo->modified_time = modified;
     photo->index = (uint32_t)slot;
-    
+
     /* Compute extension hash for fast filtering */
-    const char *ext = get_extension(photo->path + photo->name_offset);
+    const char *ext = get_extension(collection->path_pool + photo->path_offset + photo->name_offset);
     photo->ext_hash = hash_extension(ext);
-    
+
     /* Release lock after all writes complete */
     pthread_mutex_unlock(lock);
-    
+
     return true;
 }
 
@@ -248,19 +411,18 @@ static inline bool collection_add_locked(
  * Batch Attribute Fetching with getattrlistbulk
  * ============================================================================ */
 
-/* Attribute buffer entry structure */
-typedef struct __attribute__((packed)) {
-    uint32_t length;
-    attribute_set_t returned_attrs;
-    uint32_t obj_type;          /* VREG, VDIR, etc. */
-    struct timespec created;
-    struct timespec modified;
-    off_t file_size;
-    struct attrreference name_ref;
-    /* Variable-length name follows */
-} pv_attr_entry_t;
-
-/* Process a directory using getattrlistbulk - SAFE VERSION with error handling */
+/* Process a directory using getattrlistbulk
+ *
+ * Buffer layout per entry (attributes in bitmap order):
+ *   uint32_t length
+ *   attribute_set_t returned_attrs  (ATTR_CMN_RETURNED_ATTRS)
+ *   uint32_t obj_type               (ATTR_CMN_OBJTYPE)
+ *   struct timespec crtime          (ATTR_CMN_CRTIME)
+ *   struct timespec modtime         (ATTR_CMN_MODTIME)
+ *   struct attrreference name_ref   (ATTR_CMN_NAME)
+ *   off_t file_size                 (ATTR_FILE_DATALENGTH - only for files!)
+ *   [variable: name string]
+ */
 static int scan_directory_batch_safe(
     pv_photo_collection_t *collection,
     const char *dir_path,
@@ -268,168 +430,166 @@ static int scan_directory_batch_safe(
     dispatch_queue_t queue,
     dispatch_group_t group
 ) {
-    /* Validate inputs */
     if (collection == NULL || dir_path == NULL || dir_fd < 0) {
-        PV_LOG_ERROR("Invalid parameters: collection=%p, dir_path=%s, dir_fd=%d",
-                     (void*)collection, dir_path ? dir_path : "NULL", dir_fd);
+        PV_LOG_ERROR("Invalid parameters");
         return -1;
     }
-    
+
     struct attrlist attr_list = {
         .bitmapcount = ATTR_BIT_MAP_COUNT,
-        .commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_OBJTYPE | 
+        .commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_OBJTYPE |
                       ATTR_CMN_CRTIME | ATTR_CMN_MODTIME | ATTR_CMN_NAME,
         .fileattr = ATTR_FILE_DATALENGTH
     };
-    
+
     char *buffer = aligned_alloc(PV_CACHE_LINE_SIZE, ATTR_BUFFER_SIZE);
     if (buffer == NULL) {
-        PV_LOG_ERROR("Failed to allocate buffer (%d bytes)", ATTR_BUFFER_SIZE);
+        PV_LOG_ERROR("Failed to allocate buffer");
         return -1;
     }
-    
+
+    pv_photo_batch_t batch = {0};
     int found = 0;
     const size_t dir_path_len = strlen(dir_path);
-    
-    PV_LOG_DEBUG("Scanning directory: %s (fd=%d)", dir_path, dir_fd);
-    
+
     while (1) {
-        const int count = getattrlistbulk(
-            dir_fd,
-            &attr_list,
-            buffer,
-            ATTR_BUFFER_SIZE,
-            0  /* options */
-        );
-        
+        const int count = getattrlistbulk(dir_fd, &attr_list, buffer, ATTR_BUFFER_SIZE, 0);
+
         if (count < 0) {
-            PV_LOG_ERROR("getattrlistbulk failed for %s: %s (errno=%d)", 
-                         dir_path, strerror(errno), errno);
+            PV_LOG_ERROR("getattrlistbulk failed: %s", strerror(errno));
             break;
         }
-        
-        if (count == 0) {
-            /* No more entries */
-            break;
-        }
-        
-        PV_LOG_DEBUG("Got %d entries from %s", count, dir_path);
-        
-        /* Process entries */
-        char *entry_ptr = buffer;
-        
+        if (count == 0) break;
+
+        char *ptr = buffer;
+
         for (int i = 0; i < count; i++) {
-            /* Validate entry pointer is within buffer */
-            if (entry_ptr < buffer || entry_ptr >= buffer + ATTR_BUFFER_SIZE) {
-                PV_LOG_ERROR("Entry pointer out of bounds at index %d", i);
+            /* Entry length */
+            uint32_t entry_length = *(uint32_t *)ptr;
+            if (entry_length == 0 || ptr + entry_length > buffer + ATTR_BUFFER_SIZE) {
                 break;
             }
-            
-            /* Read entry length first */
-            uint32_t entry_length = *(uint32_t *)entry_ptr;
-            
-            if (entry_length == 0 || entry_length > ATTR_BUFFER_SIZE) {
-                PV_LOG_ERROR("Invalid entry length %u at index %d", entry_length, i);
-                break;
+            char *entry_start = ptr;
+            ptr += sizeof(uint32_t);
+
+            /* Skip returned_attrs */
+            ptr += sizeof(attribute_set_t);
+
+            /* Attributes come in BIT ORDER within each category:
+             * ATTR_CMN_NAME        = 0x00000001  (first)
+             * ATTR_CMN_OBJTYPE     = 0x00000008
+             * ATTR_CMN_CRTIME      = 0x00000200
+             * ATTR_CMN_MODTIME     = 0x00000400
+             * Then ATTR_FILE_DATALENGTH for files
+             */
+
+            /* Name reference (ATTR_CMN_NAME = 0x1, comes first) */
+            char *name_ref_ptr = ptr;
+            struct attrreference name_ref = *(struct attrreference *)ptr;
+            ptr += sizeof(struct attrreference);
+            const char *name = name_ref_ptr + name_ref.attr_dataoffset;
+
+            /* Object type (ATTR_CMN_OBJTYPE = 0x8) */
+            uint32_t obj_type = *(uint32_t *)ptr;
+            ptr += sizeof(uint32_t);
+
+            /* Creation time (ATTR_CMN_CRTIME = 0x200) */
+            struct timespec crtime = *(struct timespec *)ptr;
+            ptr += sizeof(struct timespec);
+
+            /* Modification time (ATTR_CMN_MODTIME = 0x400) */
+            struct timespec modtime = *(struct timespec *)ptr;
+            ptr += sizeof(struct timespec);
+
+            /* File size (ATTR_FILE_DATALENGTH - only for regular files) */
+            off_t file_size = 0;
+            if (obj_type == VREG) {
+                file_size = *(off_t *)ptr;
             }
-            
-            pv_attr_entry_t *entry = (pv_attr_entry_t *)entry_ptr;
-            
-            /* The name is at an offset from the name_ref field itself */
-            const char *name = ((char *)&entry->name_ref) + entry->name_ref.attr_dataoffset;
-            
+
             /* Validate name pointer */
             if (name < buffer || name >= buffer + ATTR_BUFFER_SIZE) {
-                PV_LOG_ERROR("Name pointer out of bounds at index %d", i);
-                entry_ptr += entry_length;
+                ptr = entry_start + entry_length;
                 continue;
             }
-            
+
             /* Validate name is null-terminated within buffer */
             size_t max_name_len = (buffer + ATTR_BUFFER_SIZE) - name;
             size_t name_len = strnlen(name, max_name_len);
             if (name_len == max_name_len) {
                 PV_LOG_ERROR("Name not null-terminated at index %d", i);
-                entry_ptr += entry_length;
+                ptr = entry_start + entry_length;
                 continue;
             }
-            
+
             /* Skip hidden files */
             if (name[0] == '.') {
-                entry_ptr += entry_length;
+                ptr = entry_start + entry_length;
                 continue;
             }
-            
+
             /* Handle directories recursively */
-            if (entry->obj_type == VDIR) {
-                /* Build subdirectory path */
+            if (obj_type == VDIR) {
                 char *subdir_path = malloc(dir_path_len + name_len + 2);
-                
                 if (subdir_path != NULL) {
                     memcpy(subdir_path, dir_path, dir_path_len);
                     subdir_path[dir_path_len] = '/';
                     memcpy(subdir_path + dir_path_len + 1, name, name_len + 1);
-                    
-                    PV_LOG_DEBUG("Queueing subdirectory: %s", subdir_path);
-                    
-                    /* Dispatch recursive scan to GCD queue */
+
                     dispatch_group_async(group, queue, ^{
                         const int sub_fd = open(subdir_path, O_RDONLY | O_DIRECTORY);
                         if (sub_fd >= 0) {
                             scan_directory_batch_safe(collection, subdir_path, sub_fd, queue, group);
                             close(sub_fd);
-                        } else {
-                            PV_LOG_DEBUG("Cannot open subdirectory %s: %s", subdir_path, strerror(errno));
                         }
                         free(subdir_path);
                     });
                 }
-                
-                entry_ptr += entry_length;
+                ptr = entry_start + entry_length;
                 continue;
             }
-            
+
             /* Check if regular file with supported extension */
-            if (entry->obj_type == VREG) {
+            if (obj_type == VREG) {
                 const char *ext = get_extension(name);
-                
+
                 if (is_supported_extension(ext)) {
-                    /* Build full path with overflow check */
-                    /* SECURITY: Check for integer overflow in path length calculation */
                     if (dir_path_len > SIZE_MAX - 2 - name_len) {
-                        PV_LOG_ERROR("Path length overflow");
-                        entry_ptr += entry_length;
+                        ptr = entry_start + entry_length;
                         continue;
                     }
                     const size_t full_path_len = dir_path_len + 1 + name_len;
-                    
+
                     if (full_path_len < PV_MAX_PATH) {
                         char full_path[PV_MAX_PATH];
                         memcpy(full_path, dir_path, dir_path_len);
                         full_path[dir_path_len] = '/';
                         memcpy(full_path + dir_path_len + 1, name, name_len + 1);
-                        
-                        /* Add to collection */
-                        if (collection_add_locked(
+
+                        if (batch_add(
+                            &batch,
                             collection,
                             full_path,
                             full_path_len,
                             dir_path_len + 1,
                             name_len,
-                            (uint64_t)entry->file_size,
-                            entry->created.tv_sec,
-                            entry->modified.tv_sec
+                            (uint64_t)file_size,
+                            crtime.tv_sec,
+                            modtime.tv_sec
                         )) {
                             found++;
                         }
                     }
                 }
             }
-            
-            entry_ptr += entry_length;
+
+            ptr = entry_start + entry_length;
         }
     }
     
+    /* Flush any remaining items in batch */
+    collection_add_batch(collection, &batch);
+
     free(buffer);
     PV_LOG_DEBUG("Found %d photos in %s", found, dir_path);
     return found;
@@ -542,11 +702,11 @@ static int scan_with_fts_parallel(pv_photo_collection_t *collection, const char 
  * ============================================================================ */
 
 /* Radix sort by creation time - sorts INDICES not structs for speed */
-static void radix_sort_by_date(pv_photo_t *photos, size_t count) {
+static void radix_sort_by_date(pv_photo_t * PV_RESTRICT photos, size_t count) {
     if (count < 2) {
         return;
     }
-    
+
     /* For very small arrays, use simple insertion sort */
     if (count < 32) {
         for (size_t i = 1; i < count; i++) {
@@ -560,22 +720,17 @@ static void radix_sort_by_date(pv_photo_t *photos, size_t count) {
         }
         return;
     }
-    
+
     /* Allocate index arrays - MUCH smaller than full struct arrays */
     uint32_t *indices = malloc(count * sizeof(uint32_t));
     uint32_t *temp_indices = malloc(count * sizeof(uint32_t));
-    
+
     if (indices == NULL || temp_indices == NULL) {
         free(indices);
         free(temp_indices);
         return;
     }
-    
-    /* Initialize indices */
-    for (size_t i = 0; i < count; i++) {
-        indices[i] = (uint32_t)i;
-    }
-    
+
     /* Extract timestamps for cache efficiency */
     uint64_t *timestamps = malloc(count * sizeof(uint64_t));
     if (timestamps == NULL) {
@@ -583,12 +738,13 @@ static void radix_sort_by_date(pv_photo_t *photos, size_t count) {
         free(temp_indices);
         return;
     }
-    
-    /* Pre-compute inverted timestamps (newest first) */
+
+    /* Initialize indices and pre-compute inverted timestamps (newest first) */
     for (size_t i = 0; i < count; i++) {
+        indices[i] = (uint32_t)i;
         timestamps[i] = ~(uint64_t)photos[i].created_time;
     }
-    
+
     /* Determine which bytes actually vary (skip constant upper bytes) */
     uint64_t all_or = 0, all_and = ~0ULL;
     for (size_t i = 0; i < count; i++) {
@@ -596,27 +752,30 @@ static void radix_sort_by_date(pv_photo_t *photos, size_t count) {
         all_and &= timestamps[i];
     }
     const uint64_t varying_bits = all_or ^ all_and;
-    
+
     /* Count arrays for each byte (256 buckets) */
     size_t counts[256];
-    uint32_t *src = indices;
-    uint32_t *dst = temp_indices;
-    
+    uint32_t * PV_RESTRICT src = indices;
+    uint32_t * PV_RESTRICT dst = temp_indices;
+
     /* Sort by each byte of the timestamp (LSB first), skip constant bytes */
     for (int byte = 0; byte < 8; byte++) {
         /* Skip bytes that don't vary - common when photos are from same period */
         if (((varying_bits >> (byte * 8)) & 0xFF) == 0) {
             continue;
         }
-        
+
         memset(counts, 0, sizeof(counts));
-        
-        /* Count occurrences */
+
+        /* Count occurrences with prefetching */
         for (size_t i = 0; i < count; i++) {
+            if (i + 8 < count) {
+                PV_PREFETCH(&timestamps[src[i + 8]]);
+            }
             const uint8_t bucket = (timestamps[src[i]] >> (byte * 8)) & 0xFF;
             counts[bucket]++;
         }
-        
+
         /* Compute prefix sums */
         size_t total = 0;
         for (int i = 0; i < 256; i++) {
@@ -624,40 +783,48 @@ static void radix_sort_by_date(pv_photo_t *photos, size_t count) {
             counts[i] = total;
             total += old_count;
         }
-        
-        /* Distribute to output */
+
+        /* Distribute to output with prefetching */
         for (size_t i = 0; i < count; i++) {
+            if (i + 8 < count) {
+                PV_PREFETCH(&timestamps[src[i + 8]]);
+            }
             const uint8_t bucket = (timestamps[src[i]] >> (byte * 8)) & 0xFF;
             dst[counts[bucket]++] = src[i];
         }
-        
+
         /* Swap buffers */
         uint32_t *swap = src;
         src = dst;
         dst = swap;
     }
-    
+
     /* Reorder photos array according to sorted indices */
-    /* Use temp buffer to avoid in-place permutation complexity */
     pv_photo_t *temp_photos = aligned_alloc(PV_CACHE_LINE_SIZE, count * sizeof(pv_photo_t));
     if (temp_photos != NULL) {
         for (size_t i = 0; i < count; i++) {
+            if (i + 2 < count) {
+                PV_PREFETCH(&photos[src[i + 2]]);
+            }
             temp_photos[i] = photos[src[i]];
         }
         memcpy(photos, temp_photos, count * sizeof(pv_photo_t));
         free(temp_photos);
     }
-    
+
     free(timestamps);
     free(indices);
     free(temp_indices);
 }
 
-/* Comparison function for name sorting */
-static int compare_by_name(const void *a, const void *b) {
+/* Comparison function for name sorting - uses path pool via context */
+static int compare_by_name(void *context, const void *a, const void *b) {
+    const char *path_pool = (const char *)context;
     const pv_photo_t *pa = (const pv_photo_t *)a;
     const pv_photo_t *pb = (const pv_photo_t *)b;
-    return strcasecmp(pa->path + pa->name_offset, pb->path + pb->name_offset);
+    const char *name_a = path_pool + pa->path_offset + pa->name_offset;
+    const char *name_b = path_pool + pb->path_offset + pb->name_offset;
+    return strcasecmp(name_a, name_b);
 }
 
 /* ============================================================================
@@ -721,8 +888,24 @@ pv_photo_collection_t *pv_collection_create(void) {
     collection->_internal_lock = lock;
     collection->capacity = PV_INITIAL_CAPACITY;
     collection->count = 0;
-    
-    PV_LOG_DEBUG("Collection created with capacity %zu", collection->capacity);
+
+    /* Initialize path pool - page-aligned for better memory performance */
+    collection->path_pool = aligned_alloc(4096, PV_PATH_POOL_INITIAL_SIZE);
+    if (collection->path_pool == NULL) {
+        PV_LOG_ERROR("Failed to allocate path pool (%d bytes)", PV_PATH_POOL_INITIAL_SIZE);
+        pthread_mutex_destroy(lock);
+        free(lock);
+        free(collection->photos);
+        free(collection);
+        return NULL;
+    }
+    /* Tell kernel we'll access path pool sequentially - improves prefetching */
+    madvise(collection->path_pool, PV_PATH_POOL_INITIAL_SIZE, MADV_SEQUENTIAL);
+    collection->path_pool_size = 0;
+    collection->path_pool_capacity = PV_PATH_POOL_INITIAL_SIZE;
+
+    PV_LOG_DEBUG("Collection created with capacity %zu, path pool %d bytes",
+                 collection->capacity, PV_PATH_POOL_INITIAL_SIZE);
     
     return collection;
 }
@@ -746,10 +929,18 @@ void pv_collection_free(pv_photo_collection_t *collection) {
         free(collection->photos);
         collection->photos = NULL;
     }
-    
+
+    /* Free path pool */
+    if (collection->path_pool != NULL) {
+        free(collection->path_pool);
+        collection->path_pool = NULL;
+    }
+    collection->path_pool_size = 0;
+    collection->path_pool_capacity = 0;
+
     collection->count = 0;
     collection->capacity = 0;
-    
+
     free(collection);
 }
 
@@ -786,9 +977,10 @@ int pv_scan_directory_ex(
     }
     
     PV_LOG_DEBUG("Starting scan of: %s", directory_path);
-    
+
     /* Reset collection */
     collection->count = 0;
+    collection->path_pool_size = 0;  /* Reset path pool */
     collection->directories_scanned = 0;
     collection->files_examined = 0;
     
@@ -921,17 +1113,18 @@ void pv_collection_sort_by_date(pv_photo_collection_t *collection) {
 }
 
 void pv_collection_sort_by_name(pv_photo_collection_t *collection) {
-    if (collection == NULL) {
+    if (collection == NULL || collection->path_pool == NULL) {
         return;
     }
-    
+
     const size_t count = collection->count;
     if (count < 2) {
         return;
     }
-    
-    qsort(collection->photos, count, sizeof(pv_photo_t), compare_by_name);
-    
+
+    /* Use qsort_r to pass path_pool as context */
+    qsort_r(collection->photos, count, sizeof(pv_photo_t), collection->path_pool, compare_by_name);
+
     /* Update indices */
     for (size_t i = 0; i < count; i++) {
         collection->photos[i].index = (uint32_t)i;
@@ -997,22 +1190,27 @@ pv_simd_caps_t pv_get_simd_capabilities(void) {
  * Photo Accessor Functions (for Swift compatibility)
  * ============================================================================ */
 
-const char *pv_photo_get_path(const pv_photo_t *photo) {
-    if (photo == NULL) {
+const char *pv_photo_get_path(const pv_photo_collection_t *collection, const pv_photo_t *photo) {
+    if (collection == NULL || photo == NULL || collection->path_pool == NULL) {
         return "";
     }
-    return photo->path;
+    /* SECURITY: Validate path_offset is within pool bounds */
+    if (photo->path_offset >= collection->path_pool_size) {
+        return "";
+    }
+    return collection->path_pool + photo->path_offset;
 }
 
-const char *pv_photo_get_name(const pv_photo_t *photo) {
-    if (photo == NULL) {
+const char *pv_photo_get_name(const pv_photo_collection_t *collection, const pv_photo_t *photo) {
+    if (collection == NULL || photo == NULL || collection->path_pool == NULL) {
         return "";
     }
-    /* SECURITY: Validate name_offset is within path bounds */
-    if (photo->name_offset >= PV_MAX_PATH || photo->name_offset > photo->path_len) {
+    /* SECURITY: Validate offsets are within pool bounds */
+    size_t name_abs_offset = photo->path_offset + photo->name_offset;
+    if (name_abs_offset >= collection->path_pool_size) {
         return "";
     }
-    return photo->path + photo->name_offset;
+    return collection->path_pool + name_abs_offset;
 }
 
 uint64_t pv_photo_get_size(const pv_photo_t *photo) {
